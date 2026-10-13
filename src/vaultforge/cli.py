@@ -1,0 +1,453 @@
+"""Command line interface for VaultForge.
+
+This module is deliberately thin: it parses arguments, builds a policy, calls
+into :mod:`vaultforge.generators`, and prints the result to stdout. Generated
+secrets are the product of the tool, so they go to stdout and nowhere else --
+they are never written to a log, a file, or an error stream.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from pathlib import Path
+
+import typer
+
+from . import __version__
+from . import otp as otp_lib
+from .generators import (
+    generate_hex_token,
+    generate_passphrase,
+    generate_password,
+    generate_pin,
+    generate_urlsafe_token,
+)
+from .limits import (
+    DEFAULT_OTP_SECRET_BYTES,
+    MAX_COUNT,
+    MAX_OTP_SECRET_BYTES,
+    MAX_PASSPHRASE_WORDS,
+    MAX_PASSWORD_LENGTH,
+    MAX_PIN_LENGTH,
+    MAX_TOKEN_BYTES,
+    MIN_OTP_SECRET_BYTES,
+)
+from .otp import OTPError
+from .policy import PasswordPolicy, PolicyError
+from .vault import service as vault_service
+from .vault import store as vault_store
+from .vault.errors import AuthError, VaultError
+from .wordlist import WordListError
+
+app = typer.Typer(
+    name="vaultforge",
+    help="Generate passwords, PINs, tokens, and passphrases, and handle TOTP codes.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+
+class TokenEncoding(str, Enum):
+    """Supported token encodings."""
+
+    hex = "hex"
+    urlsafe = "urlsafe"
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"vaultforge {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the version and exit.",
+    ),
+) -> None:
+    """VaultForge command line interface."""
+
+
+@app.command()
+def password(
+    length: int = typer.Option(
+        16,
+        "--length",
+        "-l",
+        min=1,
+        max=MAX_PASSWORD_LENGTH,
+        help=f"Total number of characters (1-{MAX_PASSWORD_LENGTH}).",
+    ),
+    lowercase: bool = typer.Option(
+        True, "--lowercase/--no-lowercase", help="Include lowercase letters (a-z)."
+    ),
+    uppercase: bool = typer.Option(
+        True, "--uppercase/--no-uppercase", help="Include uppercase letters (A-Z)."
+    ),
+    digits: bool = typer.Option(True, "--digits/--no-digits", help="Include digits (0-9)."),
+    symbols: bool = typer.Option(
+        True, "--symbols/--no-symbols", help="Include punctuation symbols."
+    ),
+    exclude_ambiguous: bool = typer.Option(
+        False,
+        "--exclude-ambiguous/--no-exclude-ambiguous",
+        help="Exclude easily confused characters (0 O o 1 l I |).",
+    ),
+    count: int = typer.Option(
+        1, "--count", "-n", min=1, max=MAX_COUNT, help="How many passwords to generate."
+    ),
+) -> None:
+    """Generate one or more random passwords."""
+    policy = PasswordPolicy(
+        length=length,
+        lowercase=lowercase,
+        uppercase=uppercase,
+        digits=digits,
+        symbols=symbols,
+        exclude_ambiguous=exclude_ambiguous,
+    )
+    try:
+        for _ in range(count):
+            typer.echo(generate_password(policy))
+    except PolicyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def pin(
+    digits: int = typer.Option(
+        6,
+        "--digits",
+        "-d",
+        min=1,
+        max=MAX_PIN_LENGTH,
+        help=f"Number of digits (1-{MAX_PIN_LENGTH}).",
+    ),
+    count: int = typer.Option(
+        1, "--count", "-n", min=1, max=MAX_COUNT, help="How many PINs to generate."
+    ),
+) -> None:
+    """Generate a numeric PIN, preserving leading zeroes."""
+    try:
+        for _ in range(count):
+            typer.echo(generate_pin(digits))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def token(
+    num_bytes: int = typer.Option(
+        32,
+        "--bytes",
+        "-b",
+        min=1,
+        max=MAX_TOKEN_BYTES,
+        help=f"Entropy in bytes (1-{MAX_TOKEN_BYTES}).",
+    ),
+    encoding: TokenEncoding = typer.Option(
+        TokenEncoding.hex, "--encoding", "-e", help="Output encoding: hex or urlsafe."
+    ),
+    count: int = typer.Option(
+        1, "--count", "-n", min=1, max=MAX_COUNT, help="How many tokens to generate."
+    ),
+) -> None:
+    """Generate a cryptographically secure hex or URL-safe token."""
+    try:
+        for _ in range(count):
+            if encoding is TokenEncoding.hex:
+                typer.echo(generate_hex_token(num_bytes))
+            else:
+                typer.echo(generate_urlsafe_token(num_bytes))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def passphrase(
+    words: int = typer.Option(
+        6,
+        "--words",
+        "-w",
+        min=1,
+        max=MAX_PASSPHRASE_WORDS,
+        help=f"Number of words (1-{MAX_PASSPHRASE_WORDS}).",
+    ),
+    separator: str = typer.Option("-", "--separator", "-s", help="String placed between words."),
+    capitalize: bool = typer.Option(
+        False, "--capitalize/--no-capitalize", help="Capitalise each word."
+    ),
+    count: int = typer.Option(
+        1, "--count", "-n", min=1, max=MAX_COUNT, help="How many passphrases to generate."
+    ),
+) -> None:
+    """Generate a memorable passphrase from the bundled word list."""
+    try:
+        for _ in range(count):
+            typer.echo(generate_passphrase(words, separator=separator, capitalize=capitalize))
+    except (ValueError, WordListError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+otp_app = typer.Typer(
+    help="Generate and verify time-based one-time passwords (TOTP).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(otp_app, name="otp")
+
+
+def _read_secret(secret_file: Path | None) -> str:
+    """Return a TOTP secret from a file, or prompt for it.
+
+    The value is never accepted as a command-line argument: argv is visible in
+    process listings and shell history.
+    """
+    if secret_file is not None:
+        try:
+            return secret_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise typer.BadParameter(f"could not read secret file '{secret_file}': {exc}") from exc
+    return typer.prompt("TOTP secret", hide_input=True, err=True)
+
+
+def _read_code(code_file: Path | None) -> str:
+    """Return an OTP code from a file, or prompt for it (never via argv)."""
+    if code_file is not None:
+        try:
+            return code_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise typer.BadParameter(f"could not read code file '{code_file}': {exc}") from exc
+    return typer.prompt("OTP code", hide_input=True, err=True)
+
+
+@otp_app.command("secret")
+def otp_secret(
+    num_bytes: int = typer.Option(
+        DEFAULT_OTP_SECRET_BYTES,
+        "--bytes",
+        "-b",
+        help=f"Secret entropy in bytes ({MIN_OTP_SECRET_BYTES}-{MAX_OTP_SECRET_BYTES}).",
+    ),
+) -> None:
+    """Generate a random base32 TOTP secret (enrol it in your authenticator)."""
+    try:
+        typer.echo(otp_lib.generate_secret(num_bytes))
+    except OTPError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@otp_app.command("generate")
+def otp_generate(
+    secret_file: Path | None = typer.Option(
+        None,
+        "--secret-file",
+        help="Read the base32 secret from this file instead of prompting.",
+    ),
+    digits: int = typer.Option(6, "--digits", "-d", help="Code length: 6, 7, or 8."),
+    period: int = typer.Option(30, "--period", "-p", help="Time step in seconds."),
+    algorithm: otp_lib.Algorithm = typer.Option(
+        otp_lib.Algorithm.sha1, "--algorithm", "-a", help="HMAC hash: sha1, sha256, or sha512."
+    ),
+    at: float | None = typer.Option(
+        None, "--at", help="Generate for a POSIX timestamp instead of the current time."
+    ),
+    show_remaining: bool = typer.Option(
+        False,
+        "--show-remaining",
+        help="Also print seconds until the code rolls over (to stderr).",
+    ),
+) -> None:
+    """Generate the current TOTP code for a secret."""
+    secret = _read_secret(secret_file)
+    try:
+        if show_remaining:
+            remaining = otp_lib.time_remaining(period, for_time=at)
+            typer.echo(f"{remaining}s remaining", err=True)
+        typer.echo(
+            otp_lib.generate_code(
+                secret, digits=digits, period=period, algorithm=algorithm, for_time=at
+            )
+        )
+    except OTPError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@otp_app.command("verify")
+def otp_verify(
+    secret_file: Path | None = typer.Option(
+        None,
+        "--secret-file",
+        help="Read the base32 secret from this file instead of prompting.",
+    ),
+    code_file: Path | None = typer.Option(
+        None,
+        "--code-file",
+        help="Read the code from this file instead of prompting.",
+    ),
+    digits: int = typer.Option(6, "--digits", "-d", help="Code length: 6, 7, or 8."),
+    period: int = typer.Option(30, "--period", "-p", help="Time step in seconds."),
+    algorithm: otp_lib.Algorithm = typer.Option(
+        otp_lib.Algorithm.sha1, "--algorithm", "-a", help="HMAC hash: sha1, sha256, or sha512."
+    ),
+    at: float | None = typer.Option(
+        None, "--at", help="Verify against a POSIX timestamp instead of the current time."
+    ),
+    window: int = typer.Option(
+        0,
+        "--window",
+        "-w",
+        help="Accept this many time steps of clock skew on each side.",
+    ),
+) -> None:
+    """Verify a TOTP code, exiting 0 when valid and 1 when not."""
+    secret = _read_secret(secret_file)
+    code = _read_code(code_file)
+    try:
+        valid = otp_lib.verify_code(
+            secret,
+            code,
+            digits=digits,
+            period=period,
+            algorithm=algorithm,
+            for_time=at,
+            valid_window=window,
+        )
+    except OTPError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo("valid" if valid else "invalid")
+    if not valid:
+        raise typer.Exit(code=1)
+
+
+@otp_app.command("uri")
+def otp_uri(
+    secret_file: Path | None = typer.Option(
+        None,
+        "--secret-file",
+        help="Read the base32 secret from this file instead of prompting.",
+    ),
+    name: str = typer.Option(..., "--name", "-n", help="Account label, e.g. an email address."),
+    issuer: str | None = typer.Option(None, "--issuer", "-i", help="Optional service/issuer name."),
+    digits: int = typer.Option(6, "--digits", "-d", help="Code length: 6, 7, or 8."),
+    period: int = typer.Option(30, "--period", "-p", help="Time step in seconds."),
+    algorithm: otp_lib.Algorithm = typer.Option(
+        otp_lib.Algorithm.sha1, "--algorithm", "-a", help="HMAC hash: sha1, sha256, or sha512."
+    ),
+) -> None:
+    """Print an otpauth:// URI for enrolling a secret in an authenticator app."""
+    secret = _read_secret(secret_file)
+    try:
+        typer.echo(
+            otp_lib.provisioning_uri(
+                secret,
+                name=name,
+                issuer=issuer,
+                digits=digits,
+                period=period,
+                algorithm=algorithm,
+            )
+        )
+    except OTPError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+# --- vault ----------------------------------------------------------------
+
+_EXIT_AUTH_FAILURE = 1
+_EXIT_ERROR = 2
+
+vault_app = typer.Typer(
+    help="Create and open the local encrypted vault.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(vault_app, name="vault")
+
+
+def _vault_path(vault: Path | None) -> Path:
+    return vault if vault is not None else vault_service.default_vault_path()
+
+
+def _prompt_new_password() -> bytes:
+    # default="" lets an empty entry through so we can reject it with a clear
+    # message instead of letting click re-prompt until it aborts.
+    first = typer.prompt(
+        "Master password", hide_input=True, confirmation_prompt=False, default="", err=True
+    )
+    if not first:
+        typer.echo("error: master password must not be empty", err=True)
+        raise typer.Exit(code=_EXIT_ERROR)
+    second = typer.prompt("Confirm master password", hide_input=True, default="", err=True)
+    if first != second:
+        typer.echo("error: master passwords do not match", err=True)
+        raise typer.Exit(code=_EXIT_ERROR)
+    return first.encode("utf-8")
+
+
+def _prompt_password() -> bytes:
+    return typer.prompt("Master password", hide_input=True, default="", err=True).encode("utf-8")
+
+
+@vault_app.command("init")
+def vault_init(
+    vault: Path | None = typer.Option(
+        None,
+        "--vault",
+        help="Path to the vault file (default: ~/.vaultforge/vault.vf).",
+    ),
+) -> None:
+    """Create a new encrypted vault with an empty payload."""
+    path = _vault_path(vault)
+    password = _prompt_new_password()
+    try:
+        header = vault_service.initialize_vault(path, password)
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(f"initialized vault at {path} (id {header.vault_id.hex()})", err=True)
+    typer.echo(
+        "warning: recovery is disabled; if the master password is lost this vault "
+        "cannot be opened. Keep an encrypted backup and the password safe.",
+        err=True,
+    )
+
+
+@vault_app.command("unlock")
+def vault_unlock(
+    vault: Path | None = typer.Option(
+        None,
+        "--vault",
+        help="Path to the vault file (default: ~/.vaultforge/vault.vf).",
+    ),
+) -> None:
+    """Verify the master password once and exit (no session is kept)."""
+    path = _vault_path(vault)
+    password = _prompt_password()
+    try:
+        if vault_store.insecure_permissions(path):
+            typer.echo(
+                f"warning: {path} is readable by group/other users; "
+                f"run 'chmod 600 {path}' to restrict it.",
+                err=True,
+            )
+    except OSError:
+        pass
+    try:
+        vault_service.unlock_vault(path, password)
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo("ok", err=True)
+
+
+if __name__ == "__main__":
+    app()

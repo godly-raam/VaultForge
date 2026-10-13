@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vaultforge"
+version = "0.1.0"
+description = "Security-first CLI toolkit for generating passwords, PINs, tokens, and passphrases."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "VaultForge contributors" }]
+keywords = ["security", "password", "generator", "passphrase", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "typer>=0.9",
+    "cryptography>=44",
+]
+
+[project.optional-dependencies]
+otp = [
+    "pyotp>=2.9,<3",
+]
+dev = [
+    "pytest>=7",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pyotp>=2.9,<3",
+]
+
+[project.scripts]
+vaultforge = "vaultforge.cli:app"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vaultforge = ["data/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+    "S",  # flake8-bandit (security-focused)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer's option syntax uses function calls as defaults (B008) and password
+# generation legitimately constructs secrets (S311-equivalent flags do not apply).
+"src/vaultforge/cli.py" = ["B008"]
+# RFC 6238 specifies HMAC-SHA-1 as the (mandatory) default algorithm, so using
+# hashlib.sha1 here is required by the standard, not a weakness in our code.
+"src/vaultforge/otp.py" = ["S324"]
+# Tests use asserts, subprocess with a trusted interpreter, and hardcoded
+# sample passwords/strings.
+"tests/*" = ["S101", "S105", "S603", "S607", "S324"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vaultforge"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
+
