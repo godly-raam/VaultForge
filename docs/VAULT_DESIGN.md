@@ -1,12 +1,14 @@
 # VaultForge Encrypted Vault — Design Report
 
-Status: **M1 (crypto primitives + serialization) and M2 (init + unlock)
-implemented and tested; M3+ still design only.**
+Status: **M1 (crypto primitives + serialization), M2 (init + unlock), the safe
+persistence foundation, and M3 entry CRUD are implemented and tested; later
+milestones remain unimplemented.**
 Companion document: `docs/VAULT_FORMAT.md` (frozen v1 byte-level format).
 
 This report records the architecture, threat model, decisions, and acceptance
-criteria for the local-first encrypted vault. Milestones M1 and M2 are built;
-the remaining milestones are unimplemented.
+criteria for the local-first encrypted vault. Milestones M1–M3 and the safe
+persistence foundation are built; backups and later milestones remain
+unimplemented.
 
 ---
 
@@ -123,15 +125,24 @@ profile and single AEAD. Strictly versioned; unknown versions refused.
   path exists.
 - **unlock** (implemented): one-shot password verification (section 10 of the
   format spec); the vault is only read.
-- **list/get/add/update/delete**: read-modify-write under an advisory lock with a
-  compare-and-swap guard; atomic `os.replace` of the user's own vault.
+- **Persistence foundation (implemented):** `service.update_vault` applies a
+  complete-payload transform under a sibling advisory lock, authenticates and
+  validates before writing, and commits encrypted output with snapshot-checked
+  atomic `os.replace`. Every replacement gets a fresh DEK and fresh wrap/body
+  nonces. Creation remains separate and uses atomic no-clobber linking.
+- **Entry CRUD commands (implemented):** `add`, `list`, `get`, `update`, and
+  `delete` use the locked persistence service. IDs are stable and independent of
+  titles; list output excludes fields, and get masks sensitive fields by default.
 - **backup**: encrypted copy to a new unique path; never overwrite.
 - **restore**: write a new vault to a new path; never overwrite.
 - **Permissions**: directory `0700`, file `0600`; warn on open permissions.
 - **Atomicity**: temp file in the same directory, `O_EXCL`, `fsync` file and
   directory, no-clobber `link` for new destinations, `os.replace` for updates.
-- **Concurrency**: advisory lock + CAS token (size, mtime_ns, SHA-256); abort on
-  conflict rather than lose an update.
+- **Concurrency**: VaultForge updates serialize through an advisory sibling lock
+  and verify a snapshot (device, inode, size, mtime_ns, SHA-256) before replace.
+  This prevents lost updates among cooperating VaultForge writers and detects
+  changes during an operation. Advisory locks are not enforced against arbitrary
+  external writers or reliably honored on every network filesystem.
 - **Corruption**: distinct errors for bad magic, unsupported version, invalid
   parameters, structural failure, and authentication failure.
 
@@ -149,16 +160,14 @@ profile and single AEAD. Strictly versioned; unknown versions refused.
 ## 9. CLI and data model
 
 ```
-# implemented (M2)
+# implemented
 vaultforge vault init     [--vault PATH]
 vaultforge vault unlock   [--vault PATH]
-
-# planned (M3+)
-vaultforge vault list     [--vault PATH] [--type T] [--json]
-vaultforge vault add      [--vault PATH] --type T --title S [--from-file F]
-vaultforge vault get      [--vault PATH] ENTRY_ID [--field NAME] [--reveal]
-vaultforge vault update   [--vault PATH] ENTRY_ID [--from-file F]
-vaultforge vault delete   [--vault PATH] ENTRY_ID [--yes]
+vaultforge vault list     [--vault PATH]
+vaultforge vault add      --type T --title S [--vault PATH]
+vaultforge vault get      ENTRY_ID [--vault PATH] [--reveal]
+vaultforge vault update   ENTRY_ID [--vault PATH] [--title S] [--field NAME]
+vaultforge vault delete   ENTRY_ID [--vault PATH]  # confirmation required
 vaultforge vault backup   [--vault PATH] [--out PATH]
 vaultforge vault restore  --backup PATH --out PATH
 vaultforge vault validate [--vault PATH]
@@ -209,15 +218,21 @@ next begins. Negative tests are mandatory, not optional.
 - CLI exit codes: `0` success, `1` authentication failure, `2` any other error
   (usage, missing/oversized file, existing destination, structural failure).
 
-### M3 — Entry CRUD
-- Positive: add/get/update/delete round-trip values; `list` prints metadata with
-  no secret material; output is deterministic JSON with `--json`.
-- Negative: unknown id fails cleanly; `get` without `--reveal` does not print the
-  secret; malformed entry input is rejected before writing.
+### M3 — Entry CRUD (implemented)
+- Positive: login, TOTP, recovery-code, and note entries use the existing typed
+  `fields` schema; IDs are random unique 128-bit hex values and do not change on
+  rename; add/get/update/delete persist through `update_vault`.
+- Negative: duplicate IDs, unknown IDs, invalid fields, and wrong passwords fail
+  without committing; list omits all fields; get masks sensitive fields unless
+  `--reveal`; delete requires interactive confirmation.
+- No schema version or vault-format change was made. Duplicate IDs are now
+  rejected as malformed payloads to keep ID-based operations unambiguous.
 
-### M4 — Persistence, permissions, concurrency
-- Positive: file mode `0600`, directory `0700`; interrupted write (simulated
-  failure before commit) leaves the original byte-for-byte intact.
+### M4 — Persistence, permissions, concurrency (safe persistence foundation implemented)
+- Positive: file mode `0600`, directory `0700`; interrupted replacement (simulated
+  failure before commit) leaves the original byte-for-byte intact. Store/service
+  primitives implement secure temporary writes, locking, snapshot checks, and
+  atomic replacement; M3 CRUD now uses this persistence path.
 - Negative: **interrupted write** never yields a partial vault; **concurrent
   modification** during update → `ConcurrentModificationError`; open permissions
   produce a warning; temp files are removed on failure.

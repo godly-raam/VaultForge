@@ -189,6 +189,12 @@ def test_entry_unknown_type_is_rejected():
         payload.validate_vault(vault)
 
 
+def test_entry_ids_must_be_unique_within_a_vault():
+    entry = _entry(ID_A, "note", {"body": "x"})
+    with pytest.raises(PayloadValidationError, match="duplicate entry IDs"):
+        payload.validate_vault({"schema": 1, "entries": [entry, dict(entry)]})
+
+
 def test_entry_rejects_unknown_and_missing_keys():
     extra = _entry(ID_A, "note", {"body": "x"}, surprise=1)
     with pytest.raises(PayloadValidationError):

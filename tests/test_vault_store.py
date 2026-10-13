@@ -9,6 +9,7 @@ import pytest
 
 from vaultforge.vault import store
 from vaultforge.vault.errors import (
+    ConcurrentModificationError,
     DestinationExistsError,
     InvalidVaultError,
     UnsupportedFilesystemError,
@@ -25,6 +26,70 @@ def test_write_new_vault_creates_the_file_with_its_exact_bytes(tmp_path):
     target = tmp_path / "vault.vf"
     store.write_new_vault(target, b"some bytes")
     assert target.read_bytes() == b"some bytes"
+    assert _temp_files(tmp_path) == []
+
+
+def test_write_updated_vault_atomically_replaces_matching_snapshot(tmp_path):
+    target = tmp_path / "vault.vf"
+    target.write_bytes(b"o" * 200)
+    snapshot = store.read_vault_snapshot(target)
+
+    store.write_updated_vault(target, b"n" * 200, snapshot)
+
+    assert target.read_bytes() == b"n" * 200
+    assert _temp_files(tmp_path) == []
+
+
+def test_write_updated_vault_rejects_a_stale_snapshot(tmp_path):
+    target = tmp_path / "vault.vf"
+    target.write_bytes(b"o" * 200)
+    snapshot = store.read_vault_snapshot(target)
+    target.write_bytes(b"e" * 200)
+
+    with pytest.raises(ConcurrentModificationError):
+        store.write_updated_vault(target, b"r" * 200, snapshot)
+    assert target.read_bytes() == b"e" * 200
+    assert _temp_files(tmp_path) == []
+
+
+def test_write_updated_vault_write_failure_preserves_target_and_cleans_temp(tmp_path, monkeypatch):
+    target = tmp_path / "vault.vf"
+    target.write_bytes(b"o" * 200)
+    snapshot = store.read_vault_snapshot(target)
+
+    def broken_replace(source, destination):
+        raise OSError(errno.EIO, "simulated replacement failure")
+
+    monkeypatch.setattr(store.os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        store.write_updated_vault(target, b"r" * 200, snapshot)
+    assert target.read_bytes() == b"o" * 200
+    assert _temp_files(tmp_path) == []
+
+
+def test_write_updated_vault_temp_write_failure_preserves_target_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "vault.vf"
+    target.write_bytes(b"o" * 200)
+    snapshot = store.read_vault_snapshot(target)
+    monkeypatch.setattr(store.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fail")))
+
+    with pytest.raises(OSError, match="fail"):
+        store.write_updated_vault(target, b"r" * 200, snapshot)
+    assert target.read_bytes() == b"o" * 200
+    assert _temp_files(tmp_path) == []
+
+
+def test_write_updated_vault_rejects_oversized_data_before_writing(tmp_path, monkeypatch):
+    target = tmp_path / "vault.vf"
+    target.write_bytes(b"o" * 200)
+    snapshot = store.read_vault_snapshot(target)
+    monkeypatch.setattr(store, "MAX_FILE_LEN", 250)
+
+    with pytest.raises(ValueError, match="maximum size"):
+        store.write_updated_vault(target, b"x" * 251, snapshot)
+    assert target.read_bytes() == b"o" * 200
     assert _temp_files(tmp_path) == []
 
 

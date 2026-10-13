@@ -6,9 +6,9 @@ and **memorable passphrases** using only the operating system's
 cryptographically secure random number generator, generates and verifies
 **time-based one-time passwords (TOTP)** using the optional
 [`pyotp`](https://pyauth.github.io/pyotp/) library, and can create and open a
-local **encrypted vault** (Argon2id + ChaCha20-Poly1305). The vault is at an
-early stage: only `vault init` and `vault unlock` exist so far, and **vault
-recovery is disabled** -- a lost master password cannot be recovered.
+local **encrypted vault** (Argon2id + ChaCha20-Poly1305). Vault entry storage
+is available for login, TOTP, recovery-code, and note entries; **vault recovery
+is disabled** -- a lost master password cannot be recovered.
 
 > VaultForge makes no claim that any generated value is "unbreakable". Strength
 > depends on the size of the search space, how the secret is stored, and how it
@@ -98,8 +98,23 @@ vaultforge vault init --vault /path/to/my.vault
 # Vault: verify the master password and open it (one-shot; no session is kept)
 vaultforge vault unlock
 
-# Vault: open a vault at an explicit path
-vaultforge vault unlock --vault /path/to/my.vault
+# Vault: add a login (sensitive values are requested through hidden prompts)
+vaultforge vault add --type login --title Example --vault /path/to/my.vault
+
+# Vault: list non-sensitive entry metadata
+vaultforge vault list --vault /path/to/my.vault
+
+# Vault: retrieve by stable entry ID (sensitive fields masked by default)
+vaultforge vault get ENTRY_ID --vault /path/to/my.vault
+
+# Vault: explicitly reveal sensitive fields
+vaultforge vault get ENTRY_ID --reveal --vault /path/to/my.vault
+
+# Vault: rename an entry or change one field (values are prompted)
+vaultforge vault update ENTRY_ID --title New-title --vault /path/to/my.vault
+
+# Vault: delete after interactive confirmation
+vaultforge vault delete ENTRY_ID --vault /path/to/my.vault
 
 # Show version
 vaultforge --version
@@ -147,6 +162,11 @@ python -m vaultforge password --length 16
 | | `--issuer`, `-i` | none | Optional service/issuer name. |
 | `vault init` | `--vault` | `~/.vaultforge/vault.vf` | Create a new vault (refuses an existing file). |
 | `vault unlock` | `--vault` | `~/.vaultforge/vault.vf` | Verify the master password once and exit. |
+| `vault add` | `--type`, `--title`, `--vault` | required, required, default path | Add a typed entry; sensitive fields are prompted. |
+| `vault list` | `--vault` | default path | List stable IDs and non-sensitive metadata. |
+| `vault get` | `ENTRY_ID`, `--reveal`, `--vault` | required, off, default path | Retrieve by ID; sensitive fields are masked unless revealed. |
+| `vault update` | `ENTRY_ID`, `--title`, `--field`, `--vault` | required, optional, optional, default path | Rename and/or update one prompted field; ID remains stable. |
+| `vault delete` | `ENTRY_ID`, `--vault` | required, default path | Delete after interactive confirmation. |
 
 TOTP secrets and codes are **never** accepted as command-line arguments: argv
 is visible in `ps` output and shell history. Supply them through a file, or
@@ -155,11 +175,15 @@ when it is not; usage errors exit `2`.
 
 The `vault` commands read the master password from a hidden prompt (never from
 the command line) and keep the prompt, warnings, and status messages on
-**stderr**. `vault init` refuses to overwrite an existing file, commits the new
-vault with no-clobber semantics, and writes it with `0600` permissions; it also
-warns that **recovery is disabled** -- if the master password is lost, the vault
-cannot be opened. `vault unlock` verifies the password once and exits; it keeps
-no session and prints no secret material. `vault` exit codes are `0` on success,
+**stderr**. Sensitive entry values are not accepted as command-line arguments;
+entry fields are prompted for, and `get` masks password, TOTP secret, recovery
+codes, notes, and note bodies unless `--reveal` is given. Listing prints only IDs
+and metadata. Delete requires interactive confirmation. `vault init` refuses to
+overwrite an existing file and writes it with `0600` permissions; it also warns
+that **recovery is disabled** -- if the master password is lost, the vault cannot
+be opened. `vault unlock` verifies the password once and exits; it keeps no
+session. Terminal output and Python memory cannot be guaranteed secret. `vault`
+exit codes are `0` on success,
 `1` for an authentication failure (a wrong password or a tampered/corrupted
 vault, which are deliberately indistinguishable), and `2` for any other error
 (usage, missing or oversized file, an existing destination, or corruption).
@@ -424,18 +448,21 @@ the `random` module.
   and derive codes from one you provide, but protecting the secret at rest is up
   to you. A TOTP secret is a bearer credential: anyone who reads it can generate
   valid codes.
-- **The vault is early and its recovery is disabled.** Only `vault init` and
-  `vault unlock` are implemented; entry storage, listing, editing, backup, and
+- **Vault recovery is disabled.** Login, TOTP, recovery-code, and note entries
+  can be added, listed, retrieved, updated, and deleted; encrypted backup and
   password changes are not built yet. There is no recovery key or reset: lose the
-  master password and the vault cannot be opened. Unlocking verifies the
-  password but keeps no session. The v1 format does not pad entry data, so the
-  number and sizes of entries are not hidden.
+  master password and the vault cannot be opened. Unlocking verifies the password
+  but keeps no session. The v1 format does not pad entry data, so the number and
+  sizes of entries are not hidden.
 - **The vault requires a filesystem that supports hard links.** A new vault is
   published with `os.link`, which fails atomically if the destination exists;
   this is how `vault init` guarantees it never overwrites an existing file. On a
   filesystem without hard links (for example FAT/exFAT or some network mounts)
   `vault init` fails with an actionable error rather than risk leaving a partial
-  vault. `vault unlock` is unaffected.
+  vault. `vault unlock` is unaffected. Updates use atomic replacement and an
+  advisory sibling lock; this coordinates VaultForge writers but does not
+  control arbitrary external writers or guarantee safety on every network
+  filesystem.
 
 ## Word list attribution
 

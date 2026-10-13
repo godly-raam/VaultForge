@@ -1,49 +1,43 @@
 """Safe filesystem handling for vault files.
 
-This layer owns the parts of the design that touch the disk and nothing else: it
-does not know about keys or payloads. It exists to make two promises hold even
-under crashes and concurrent writers:
-
-* **Reads are bounded.** The size gate runs against ``os.stat`` before a single
-  byte is read, and the read itself is capped, so pointing VaultForge at a
-  gigantic or truncated file cannot exhaust memory.
-* **New destinations are never clobbered.** A brand-new vault is written to a
-  private temp file in the destination directory and published with ``os.link``,
-  which fails atomically if the destination already exists. Two concurrent
-  initializations cannot both succeed, and an existing file is never overwritten
-  (not even partially). Where the filesystem cannot hard-link, the write fails
-  safely rather than weakening the guarantee. Temp files are cleaned up on every
-  failure path.
-
-The exact procedure is specified in ``docs/VAULT_FORMAT.md`` section 8.
+New destinations use an atomic no-clobber hard-link commit. Existing vaults are
+replaced only by the locked, snapshot-checked atomic replacement path below.
 """
 
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import stat
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
-from .errors import DestinationExistsError, UnsupportedFilesystemError
+from .errors import (
+    ConcurrentModificationError,
+    DestinationExistsError,
+    InvalidVaultError,
+    UnsupportedFilesystemError,
+)
 from .format import MAX_FILE_LEN, check_file_size
 
 __all__ = [
+    "VaultSnapshot",
     "ensure_parent_directory",
     "insecure_permissions",
     "read_vault_bytes",
+    "read_vault_snapshot",
+    "vault_lock",
     "write_new_vault",
+    "write_updated_vault",
 ]
 
-# Temp file naming: hidden and obviously ours, in the destination directory so
-# the final commit is a same-filesystem (atomic) operation.
 _TEMP_PREFIX = ".vaultforge-"
 _TEMP_SUFFIX = ".tmp"
-
-# Errnos that mean "this filesystem cannot hardlink". Hard linking is the only
-# commit mechanism; if it is unavailable we fail safely rather than weaken the
-# no-clobber guarantee. Anything outside this set is a real error and re-raised.
 _NO_LINK_ERRNOS = frozenset(
     code
     for code in (
@@ -56,13 +50,23 @@ _NO_LINK_ERRNOS = frozenset(
     )
     if code is not None
 )
-
 _HARDLINK_UNSUPPORTED_MESSAGE = (
     "this filesystem does not support hard links, which VaultForge requires to "
     "create a vault without risking overwriting an existing file; choose a "
-    "filesystem that supports hard links (for example ext4, xfs, apfs, or ntfs) "
-    "rather than one that does not (for example FAT/exFAT or some network mounts)"
+    "filesystem that supports hard links rather than one that does not"
 )
+
+
+@dataclass(frozen=True)
+class VaultSnapshot:
+    """Identity and contents used to detect modifications before replacement."""
+
+    data: bytes
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    digest: bytes
 
 
 def ensure_parent_directory(path: Path) -> None:
@@ -70,44 +74,149 @@ def ensure_parent_directory(path: Path) -> None:
     os.makedirs(path.parent, mode=0o700, exist_ok=True)
 
 
-def read_vault_bytes(path: Path) -> bytes:
-    """Read a vault file, enforcing the size gate before and after the read.
+@contextmanager
+def vault_lock(path: Path) -> Iterator[None]:
+    """Serialize VaultForge writers using a persistent sibling lock file."""
+    lock_path = path.with_name(f".{path.name}.lock")
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        if os.name == "nt":
+            import msvcrt
 
-    The pre-read ``os.stat`` gate avoids allocating for an oversized file; the
-    post-read re-check closes the race where the file grows between the two.
-    """
-    check_file_size(path.stat().st_size)
-    with open(path, "rb") as handle:
-        data = handle.read(MAX_FILE_LEN + 1)
+            windows_crt = cast(Any, msvcrt)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            windows_crt.locking(fd, windows_crt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                windows_crt.locking(fd, windows_crt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _snapshot_from_fd(fd: int, path: Path) -> VaultSnapshot:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise InvalidVaultError("vault path is not a regular file")
+    check_file_size(before.st_size)
+    chunks: list[bytes] = []
+    remaining = MAX_FILE_LEN + 1
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    after = os.fstat(fd)
     check_file_size(len(data))
-    return data
+    current = path.stat()
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or current.st_dev != after.st_dev
+        or current.st_ino != after.st_ino
+    ):
+        raise ConcurrentModificationError("vault changed while it was being read")
+    return VaultSnapshot(
+        data=data,
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+        digest=hashlib.sha256(data).digest(),
+    )
 
 
-def write_new_vault(path: Path, data: bytes) -> None:
-    """Atomically create ``path`` with ``data``, refusing to overwrite it.
+def read_vault_snapshot(path: Path) -> VaultSnapshot:
+    """Read a bounded vault and capture an identity token for compare-and-swap."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        return _snapshot_from_fd(fd, path)
+    finally:
+        os.close(fd)
 
-    Raises :class:`DestinationExistsError` if ``path`` already exists, leaving
-    it byte-for-byte untouched. The temp file is removed on every path.
-    """
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX)
-    tmp_path = Path(tmp_name)
+
+def read_vault_bytes(path: Path) -> bytes:
+    """Read a vault file with a size gate before and after the bounded read."""
+    return read_vault_snapshot(path).data
+
+
+def _matches_snapshot(path: Path, snapshot: VaultSnapshot) -> bool:
+    try:
+        current = read_vault_snapshot(path)
+    except OSError:
+        return False
+    return (
+        current.device == snapshot.device
+        and current.inode == snapshot.inode
+        and current.size == snapshot.size
+        and current.mtime_ns == snapshot.mtime_ns
+        and current.digest == snapshot.digest
+    )
+
+
+def _write_temp(path: Path, data: bytes) -> Path:
+    if len(data) > MAX_FILE_LEN:
+        raise ValueError(f"vault file exceeds the maximum size of {MAX_FILE_LEN} bytes")
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX)
+    tmp_path = Path(name)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+    except BaseException:
+        _silent_unlink(tmp_path)
+        raise
+    return tmp_path
+
+
+def write_new_vault(path: Path, data: bytes) -> None:
+    """Atomically create ``path`` without replacing an existing destination."""
+    tmp_path = _write_temp(path, data)
+    try:
         _commit_no_clobber(tmp_path, path)
     finally:
         _silent_unlink(tmp_path)
     _fsync_directory(path.parent)
 
 
-def insecure_permissions(path: Path) -> bool:
-    """Return whether group or other permission bits are set (POSIX only).
+def write_updated_vault(path: Path, data: bytes, snapshot: VaultSnapshot) -> None:
+    """Atomically replace a vault only if its previously-read snapshot matches."""
+    tmp_path = _write_temp(path, data)
+    try:
+        if not _matches_snapshot(path, snapshot):
+            raise ConcurrentModificationError("vault changed before the update could be committed")
+        os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        _silent_unlink(tmp_path)
 
-    Always ``False`` where the notion does not apply; Windows ACLs are not
-    modelled here.
-    """
+
+def insecure_permissions(path: Path) -> bool:
+    """Return whether group or other permission bits are set (POSIX only)."""
     if os.name != "posix":
         return False
     mode = stat.S_IMODE(os.stat(path).st_mode)
@@ -115,16 +224,7 @@ def insecure_permissions(path: Path) -> bool:
 
 
 def _commit_no_clobber(tmp_path: Path, target: Path) -> None:
-    """Publish ``tmp_path`` as ``target`` without ever replacing an existing file.
-
-    ``os.link`` fails atomically with ``EEXIST`` when ``target`` already exists,
-    so an existing file is preserved byte-for-byte and two concurrent writers
-    cannot both succeed. The temp file is removed by the caller's ``finally``.
-
-    Hard links are the *only* commit primitive: where the filesystem cannot
-    provide them, this raises :class:`UnsupportedFilesystemError` instead of
-    falling back to a copy or rename that a crash could leave partial.
-    """
+    """Publish a new file by hard link; this cannot replace an existing path."""
     try:
         os.link(tmp_path, target)
     except FileExistsError as exc:
@@ -143,11 +243,7 @@ def _silent_unlink(path: Path) -> None:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Best-effort durability of the directory entry itself.
-
-    Opening and fsyncing a directory is not portable (it fails on Windows), so
-    failures here are ignored rather than surfaced.
-    """
+    """Best-effort durability of a directory entry (not supported everywhere)."""
     try:
         fd = os.open(directory, os.O_RDONLY)
     except OSError:

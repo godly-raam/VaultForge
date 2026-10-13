@@ -102,8 +102,13 @@ def validate_vault(vault: Any) -> None:
         raise PayloadValidationError("payload 'entries' must be a list")
     if len(entries) > MAX_VAULT_ENTRIES:
         raise PayloadValidationError("payload contains too many entries")
+    entry_ids: set[str] = set()
     for index, entry in enumerate(entries):
         _validate_entry(index, entry)
+        entry_id = entry["id"]
+        if entry_id in entry_ids:
+            raise PayloadValidationError("payload contains duplicate entry IDs")
+        entry_ids.add(entry_id)
 
 
 def serialize_payload(vault: Mapping[str, Any]) -> bytes:

@@ -17,6 +17,8 @@ __all__ = [
     "CorruptPayloadError",
     "CryptoParameterError",
     "DestinationExistsError",
+    "DuplicateEntryError",
+    "EntryNotFoundError",
     "InvalidVaultError",
     "NotAVaultError",
     "PayloadValidationError",
@@ -84,6 +86,14 @@ class CorruptPayloadError(PayloadValidationError):
 
 class DestinationExistsError(VaultError):
     """A destination path already exists; the operation refuses to overwrite it."""
+
+
+class DuplicateEntryError(VaultError):
+    """An entry ID is already present in the vault."""
+
+
+class EntryNotFoundError(VaultError):
+    """An entry ID does not exist in the vault."""
 
 
 class UnsupportedFilesystemError(VaultError):

@@ -8,6 +8,7 @@ they are never written to a log, a file, or an error stream.
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from pathlib import Path
 
@@ -52,6 +53,15 @@ class TokenEncoding(str, Enum):
 
     hex = "hex"
     urlsafe = "urlsafe"
+
+
+class VaultEntryType(str, Enum):
+    """Entry types supported by the frozen vault payload schema."""
+
+    login = "login"
+    totp = "totp"
+    recovery = "recovery"
+    note = "note"
 
 
 def _version_callback(value: bool) -> None:
@@ -416,6 +426,161 @@ def vault_init(
         "cannot be opened. Keep an encrypted backup and the password safe.",
         err=True,
     )
+
+
+@vault_app.command("add")
+def vault_add(
+    entry_type: VaultEntryType = typer.Option(..., "--type", help="Entry type."),
+    title: str = typer.Option(..., "--title", help="Editable entry title (the ID remains stable)."),
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
+) -> None:
+    """Add and persist an entry; sensitive fields are entered through hidden prompts."""
+    fields = _prompt_entry_fields(entry_type)
+    password = _prompt_password()
+    try:
+        entry = vault_service.add_entry(
+            _vault_path(vault), password, entry_type=entry_type.value, title=title, fields=fields
+        )
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(f"added entry {entry['id']}", err=True)
+
+
+@vault_app.command("list")
+def vault_list(
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
+) -> None:
+    """List entry IDs and non-sensitive metadata only."""
+    try:
+        entries = vault_service.list_entries(_vault_path(vault), _prompt_password())
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    metadata = [
+        {key: entry[key] for key in ("id", "type", "title", "tags", "created_at", "updated_at")}
+        for entry in entries
+    ]
+    typer.echo(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+
+
+@vault_app.command("get")
+def vault_get(
+    entry_id: str,
+    reveal: bool = typer.Option(False, "--reveal", help="Display sensitive fields unmasked."),
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
+) -> None:
+    """Retrieve an entry by stable ID; sensitive fields are masked by default."""
+    try:
+        entry = vault_service.get_entry(_vault_path(vault), _prompt_password(), entry_id)
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    if not reveal:
+        fields = dict(entry["fields"])
+        for key in ("password", "secret", "codes", "notes", "body"):
+            if key in fields:
+                fields[key] = "********"
+        entry = {**entry, "fields": fields}
+    typer.echo(json.dumps(entry, sort_keys=True, separators=(",", ":")))
+
+
+@vault_app.command("update")
+def vault_update(
+    entry_id: str,
+    title: str | None = typer.Option(None, "--title", help="Set a new editable title."),
+    field: str | None = typer.Option(None, "--field", help="Name of one field to change."),
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
+) -> None:
+    """Update an entry title and/or one prompted field without changing its ID."""
+    if title is None and field is None:
+        raise typer.BadParameter("provide --title and/or --field")
+    field_updates = {field: _prompt_entry_field_value(field)} if field is not None else None
+    try:
+        vault_service.update_entry(
+            _vault_path(vault), _prompt_password(), entry_id, title=title, fields=field_updates
+        )
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(f"updated entry {entry_id}", err=True)
+
+
+@vault_app.command("delete")
+def vault_delete(
+    entry_id: str,
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
+) -> None:
+    """Delete an entry after explicit interactive confirmation."""
+    if not typer.confirm(f"Delete entry {entry_id}?", default=False):
+        typer.echo("cancelled", err=True)
+        return
+    try:
+        vault_service.delete_entry(_vault_path(vault), _prompt_password(), entry_id)
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(f"deleted entry {entry_id}", err=True)
+
+
+def _prompt_entry_fields(entry_type: VaultEntryType) -> dict[str, object]:
+    if entry_type is VaultEntryType.login:
+        fields: dict[str, object] = {
+            "username": typer.prompt("Username"),
+            "password": typer.prompt("Password", hide_input=True),
+        }
+        url = typer.prompt("URL (optional)", default="")
+        notes = typer.prompt("Notes (optional)", default="", hide_input=True)
+        if url:
+            fields["url"] = url
+        if notes:
+            fields["notes"] = notes
+        return fields
+    if entry_type is VaultEntryType.totp:
+        fields = {
+            "secret": typer.prompt("TOTP secret", hide_input=True),
+            "digits": typer.prompt("Digits", default=6, type=int),
+            "period": typer.prompt("Period", default=30, type=int),
+            "algorithm": typer.prompt("Algorithm", default="sha1"),
+        }
+        issuer = typer.prompt("Issuer (optional)", default="")
+        account = typer.prompt("Account (optional)", default="")
+        if issuer:
+            fields["issuer"] = issuer
+        if account:
+            fields["account"] = account
+        return fields
+    if entry_type is VaultEntryType.recovery:
+        value = typer.prompt("Recovery codes (comma-separated)", hide_input=True)
+        return {"codes": [code.strip() for code in value.split(",") if code.strip()]}
+    return {"body": typer.prompt("Note body", hide_input=True)}
+
+
+def _prompt_entry_field_value(field: str) -> object:
+    value = typer.prompt(f"New {field}", hide_input=True)
+    if field in {"digits", "period"}:
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise typer.BadParameter(f"{field} must be an integer") from exc
+    if field == "codes":
+        return [code.strip() for code in value.split(",") if code.strip()]
+    return value
 
 
 @vault_app.command("unlock")

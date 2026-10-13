@@ -1,9 +1,9 @@
 # VaultForge Vault Format — Specification v1
 
-Status: **FROZEN and approved; v1 primitives (M1) and init/unlock (M2)
-implemented**. This document is the single source of truth for the on-disk vault
-format. The primitives, header layout, AAD construction, and payload
-serialization are implemented in `src/vaultforge/vault/` (`crypto.py`,
+Status: **FROZEN and approved; v1 primitives (M1), init/unlock (M2), and
+entry CRUD (M3) are implemented**. This document is the single source of truth
+for the on-disk vault format. The primitives, header layout, AAD construction,
+and payload serialization are implemented in `src/vaultforge/vault/` (`crypto.py`,
 `format.py`, `payload.py`), and file creation and one-shot unlock in
 `store.py` and `service.py`. The remaining milestones follow the roadmap in
 `docs/VAULT_DESIGN.md`.
@@ -160,7 +160,7 @@ The decrypted body is canonical JSON (UTF-8):
   "schema": 1,
   "entries": [
     {
-      "id": "<32 hex chars = 128-bit random>",
+      "id": "<unique 32 hex chars = 128-bit random; stable across renames>",
       "type": "login" | "totp" | "recovery" | "note",
       "title": "string",
       "tags": ["string", ...],
@@ -201,10 +201,10 @@ A reader executes checks in this order and rejects at the first failure:
 6. **Fixed-length fields:** salt, nonces, and `wrapped_key` must occupy their
    fixed sizes (guaranteed by the size gate; asserted defensively).
 7. **Then, and only then:** derive the KEK, unwrap, decrypt, and parse JSON.
-8. **Payload limits (after decrypt, before allocation-heavy work):**
-   entries ≤ 100,000; total payload ≤ 16 MiB; per-field string lengths capped;
-   `id` must be 32 lowercase hex chars; `type` must be a known value; JSON depth
-   bounded; unknown top-level keys rejected.
+8. **Payload limits (after decrypt, before allocation-heavy work):** entries ≤
+   100,000; total payload ≤ 16 MiB; per-field string lengths capped; IDs are
+   unique within the vault and contain 32 lowercase hex chars; types are known;
+   JSON depth is bounded; unknown keys are rejected.
 
 No `pickle`, `eval`, `exec`, or any code-executing deserialization is used
 anywhere. Only `json.loads`.
@@ -243,8 +243,10 @@ path.
 5. `os.replace(tmp, target)` (atomic on POSIX and Windows), then fsync the
    directory.
 
-Locking is advisory and may not be honored on all network filesystems; the CAS
-check is the backstop that prevents lost updates. `os.replace` here overwrites
+Locking is advisory: it coordinates cooperating VaultForge writers, but does
+not control arbitrary external writers and may not be honored on all network
+filesystems. The CAS detects changes before replacement; it is not a universal
+filesystem transaction against non-cooperating writers. `os.replace` here overwrites
 the user's *own* named vault as the explicit result of an edit they requested —
 this is not the prohibited "silent overwrite of a destination."
 
