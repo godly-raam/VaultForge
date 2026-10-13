@@ -4,9 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from vaultforge.vault import crypto
+from vaultforge.vault import crypto, service, store
 from vaultforge.vault import format as fmt
-from vaultforge.vault import service, store
 from vaultforge.vault.errors import (
     AUTH_ERROR_MESSAGE,
     AuthError,
