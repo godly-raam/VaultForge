@@ -189,8 +189,49 @@ def test_vault_cli_invalid_field_does_not_echo_prompted_value(tmp_path):
     assert "never-echo-this" not in invalid.stdout + _stderr(invalid)
 
 
-def test_vault_group_help_lists_crud_commands():
+def test_vault_backup_and_restore_create_encrypted_new_files(tmp_path):
+    source = tmp_path / "vault.vf"
+    backup = tmp_path / "backup.vf"
+    restored = tmp_path / "restored.vf"
+    assert _invoke(["vault", "init", "--vault", str(source)], [PASSWORD, PASSWORD]).exit_code == 0
+
+    backed_up = _invoke(
+        ["vault", "backup", "--vault", str(source), "--out", str(backup)], [PASSWORD]
+    )
+    assert backed_up.exit_code == 0, _stderr(backed_up)
+    assert backup.read_bytes() == source.read_bytes()
+    assert "forgotten master password" in _stderr(backed_up)
+
+    restored_result = _invoke(
+        ["vault", "restore", "--backup", str(backup), "--out", str(restored)], [PASSWORD]
+    )
+    assert restored_result.exit_code == 0, _stderr(restored_result)
+    assert restored.read_bytes() == backup.read_bytes()
+
+
+def test_vault_backup_errors_do_not_echo_password_or_overwrite(tmp_path):
+    source = tmp_path / "vault.vf"
+    backup = tmp_path / "backup.vf"
+    assert _invoke(["vault", "init", "--vault", str(source)], [PASSWORD, PASSWORD]).exit_code == 0
+    backup.write_bytes(b"existing")
+
+    existing = _invoke(
+        ["vault", "backup", "--vault", str(source), "--out", str(backup)], [PASSWORD]
+    )
+    wrong = _invoke(
+        ["vault", "backup", "--vault", str(source), "--out", str(tmp_path / "new.vf")],
+        ["wrong-password"],
+    )
+
+    assert existing.exit_code == 2
+    assert backup.read_bytes() == b"existing"
+    assert wrong.exit_code == 1
+    assert "wrong-password" not in wrong.stdout + _stderr(wrong)
+
+
+def test_vault_group_help_lists_crud_and_backup_commands():
     result = runner.invoke(app, ["vault", "--help"])
     assert result.exit_code == 0
-    for command in ("init", "unlock", "add", "list", "get", "update", "delete"):
+    commands = ("init", "unlock", "add", "list", "get", "update", "delete", "backup", "restore")
+    for command in commands:
         assert command in result.stdout

@@ -583,6 +583,41 @@ def _prompt_entry_field_value(field: str) -> object:
     return value
 
 
+@vault_app.command("backup")
+def vault_backup(
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the source vault file."),
+    output: Path | None = typer.Option(None, "--out", help="New encrypted backup path."),
+) -> None:
+    """Create an authenticated encrypted vault snapshot without overwriting files."""
+    try:
+        backup = vault_service.backup_vault(_vault_path(vault), _prompt_password(), output)
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(f"created encrypted backup at {backup}", err=True)
+    typer.echo("warning: backups do not recover a forgotten master password", err=True)
+
+
+@vault_app.command("restore")
+def vault_restore(
+    backup: Path = typer.Option(..., "--backup", help="Encrypted backup to restore."),
+    output: Path = typer.Option(..., "--out", help="New vault path to create."),
+) -> None:
+    """Restore an authenticated encrypted backup to a new path only."""
+    try:
+        restored = vault_service.restore_vault(backup, _prompt_password(), output)
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(f"restored encrypted vault to {restored}", err=True)
+
+
 @vault_app.command("unlock")
 def vault_unlock(
     vault: Path | None = typer.Option(

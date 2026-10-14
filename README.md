@@ -18,9 +18,9 @@ is disabled** -- a lost master password cannot be recovered.
 
 VaultForge is a standard `src/`-layout Python package. The declared floor is
 Python 3.10 (`requires-python = ">=3.10"`), matching the current dependency
-stack; the code has only been **verified on Python 3.11.2** in this environment.
-CI is configured to run the suite on Python 3.10-3.13 (see
-`.github/workflows/ci.yml`), but that workflow has not been executed here.
+stack. Local checks in this environment ran on Python 3.14.7; CI is configured
+to run Python 3.10-3.13 (see `.github/workflows/ci.yml`), but that workflow has
+not been executed here.
 
 Recommended, isolated installation:
 
@@ -42,10 +42,10 @@ On systems with a managed Python (for example Debian/Ubuntu with PEP 668), use:
 python3 -m pip install --break-system-packages -e ".[dev,otp]"
 ```
 
-The TOTP commands need the `otp` extra. If it is missing, the password, PIN,
-token, and passphrase commands still work, and the `otp` commands print an
-install hint instead of failing obscurely. Either way, the `vaultforge` command
-is installed on your `PATH`.
+`otp generate`, `otp verify`, and `otp uri` need the `otp` extra. `otp secret`
+works without it because it only generates random base32 material. If PyOTP is
+missing, the commands that require it print an install hint instead of failing
+obscurely. Either way, the `vaultforge` command is installed on your `PATH`.
 
 ## Usage
 
@@ -116,6 +116,12 @@ vaultforge vault update ENTRY_ID --title New-title --vault /path/to/my.vault
 # Vault: delete after interactive confirmation
 vaultforge vault delete ENTRY_ID --vault /path/to/my.vault
 
+# Vault: create an authenticated encrypted backup (never overwrites)
+vaultforge vault backup --vault /path/to/my.vault --out /path/to/backup.vf
+
+# Vault: restore a backup to a new path (never overwrites or switches the active vault)
+vaultforge vault restore --backup /path/to/backup.vf --out /path/to/restored.vf
+
 # Show version
 vaultforge --version
 ```
@@ -167,6 +173,8 @@ python -m vaultforge password --length 16
 | `vault get` | `ENTRY_ID`, `--reveal`, `--vault` | required, off, default path | Retrieve by ID; sensitive fields are masked unless revealed. |
 | `vault update` | `ENTRY_ID`, `--title`, `--field`, `--vault` | required, optional, optional, default path | Rename and/or update one prompted field; ID remains stable. |
 | `vault delete` | `ENTRY_ID`, `--vault` | required, default path | Delete after interactive confirmation. |
+| `vault backup` | `--vault`, `--out` | default path, generated sibling path | Authenticate and copy exact encrypted bytes to a new path. |
+| `vault restore` | `--backup`, `--out` | required, required | Authenticate and copy backup bytes to a new path; never replaces the active vault. |
 
 TOTP secrets and codes are **never** accepted as command-line arguments: argv
 is visible in `ps` output and shell history. Supply them through a file, or
@@ -181,9 +189,12 @@ codes, notes, and note bodies unless `--reveal` is given. Listing prints only ID
 and metadata. Delete requires interactive confirmation. `vault init` refuses to
 overwrite an existing file and writes it with `0600` permissions; it also warns
 that **recovery is disabled** -- if the master password is lost, the vault cannot
-be opened. `vault unlock` verifies the password once and exits; it keeps no
-session. Terminal output and Python memory cannot be guaranteed secret. `vault`
-exit codes are `0` on success,
+be opened. `vault backup` authenticates and copies exact encrypted vault bytes to
+a new path; it does not create a recovery path or a second password. `vault restore`
+authenticates the backup before publishing exact encrypted bytes to a new path, and
+refuses the active vault and detectable aliases. `vault unlock` verifies the
+password once and exits; it keeps no session. Terminal output and Python memory
+cannot be guaranteed secret. `vault` exit codes are `0` on success,
 `1` for an authentication failure (a wrong password or a tampered/corrupted
 vault, which are deliberately indistinguishable), and `2` for any other error
 (usage, missing or oversized file, an existing destination, or corruption).
@@ -449,11 +460,11 @@ the `random` module.
   to you. A TOTP secret is a bearer credential: anyone who reads it can generate
   valid codes.
 - **Vault recovery is disabled.** Login, TOTP, recovery-code, and note entries
-  can be added, listed, retrieved, updated, and deleted; encrypted backup and
-  password changes are not built yet. There is no recovery key or reset: lose the
-  master password and the vault cannot be opened. Unlocking verifies the password
-  but keeps no session. The v1 format does not pad entry data, so the number and
-  sizes of entries are not hidden.
+  can be added, listed, retrieved, updated, and deleted; encrypted backups can be
+  created and restored only to a new path. There is no recovery key or reset: lose
+  the master password and the vault cannot be opened, including from a backup.
+  Unlocking verifies the password but keeps no session. The v1 format does not pad
+  entry data, so the number and sizes of entries are not hidden.
 - **The vault requires a filesystem that supports hard links.** A new vault is
   published with `os.link`, which fails atomically if the destination exists;
   this is how `vault init` guarantees it never overwrites an existing file. On a

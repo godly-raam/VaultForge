@@ -21,6 +21,7 @@ from .crypto import (
     wrap_dek,
 )
 from .errors import (
+    ActiveVaultDestinationError,
     DestinationExistsError,
     DuplicateEntryError,
     EntryNotFoundError,
@@ -49,9 +50,11 @@ __all__ = [
     "default_vault_path",
     "empty_vault",
     "initialize_vault",
+    "restore_vault",
     "unlock_vault",
     "update_vault",
     "add_entry",
+    "backup_vault",
     "list_entries",
     "get_entry",
     "update_entry",
@@ -74,6 +77,8 @@ def empty_vault() -> dict[str, Any]:
 
 def initialize_vault(path: Path, password: bytes) -> VaultHeader:
     """Create a new, empty v1 vault, refusing to replace an existing path."""
+    if not password:
+        raise ValueError("master password must not be empty")
     ensure_parent_directory(path)
     if os.path.lexists(path):
         raise DestinationExistsError(f"refusing to overwrite existing file: {path}")
@@ -87,6 +92,32 @@ def initialize_vault(path: Path, password: bytes) -> VaultHeader:
 def unlock_vault(path: Path, password: bytes) -> dict[str, Any]:
     """Read and validate a vault without modifying it."""
     return _decrypt_vault_bytes(read_vault_bytes(path), password)
+
+
+def backup_vault(path: Path, password: bytes, output: Path | None = None) -> Path:
+    """Authenticate a locked snapshot and publish its exact encrypted bytes."""
+    destination = output if output is not None else _generated_backup_path(path)
+    data = _authenticated_snapshot(path, password)
+    ensure_parent_directory(destination)
+    write_new_vault(destination, data)
+    return destination
+
+
+def restore_vault(
+    backup: Path,
+    password: bytes,
+    output: Path,
+    *,
+    active_vault: Path | None = None,
+) -> Path:
+    """Authenticate a backup and publish its exact bytes to a new vault path."""
+    active_path = active_vault if active_vault is not None else default_vault_path()
+    if _paths_alias(output, active_path):
+        raise ActiveVaultDestinationError("refusing to restore over the active vault")
+    data = _authenticated_snapshot(backup, password)
+    ensure_parent_directory(output)
+    write_new_vault(output, data)
+    return output
 
 
 def update_vault(
@@ -208,6 +239,28 @@ def delete_entry(path: Path, password: bytes, entry_id: str) -> None:
         raise EntryNotFoundError("entry not found")
 
     update_vault(path, password, delete)
+
+
+def _authenticated_snapshot(path: Path, password: bytes) -> bytes:
+    """Return one bounded, authenticated source snapshot while writers are locked."""
+    with vault_lock(path):
+        snapshot = read_vault_snapshot(path)
+        _decrypt_vault_bytes(snapshot.data, password)
+        return snapshot.data
+
+
+def _generated_backup_path(path: Path) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return path.with_name(f"{path.stem}-{timestamp}-{secrets.token_hex(16)}{path.suffix}")
+
+
+def _paths_alias(first: Path, second: Path) -> bool:
+    if first.resolve(strict=False) == second.resolve(strict=False):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def _decrypt_vault_bytes(data: bytes, password: bytes) -> dict[str, Any]:

@@ -1,14 +1,13 @@
 # VaultForge Encrypted Vault — Design Report
 
 Status: **M1 (crypto primitives + serialization), M2 (init + unlock), the safe
-persistence foundation, and M3 entry CRUD are implemented and tested; later
-milestones remain unimplemented.**
+persistence foundation, M3 entry CRUD, and M5 encrypted backup/restore are
+implemented and tested; later milestones remain unimplemented.**
 Companion document: `docs/VAULT_FORMAT.md` (frozen v1 byte-level format).
 
 This report records the architecture, threat model, decisions, and acceptance
-criteria for the local-first encrypted vault. Milestones M1–M3 and the safe
-persistence foundation are built; backups and later milestones remain
-unimplemented.
+criteria for the local-first encrypted vault. Milestones M1–M3, safe persistence,
+and encrypted backup/restore are built; later milestones remain unimplemented.
 
 ---
 
@@ -133,8 +132,11 @@ profile and single AEAD. Strictly versioned; unknown versions refused.
 - **Entry CRUD commands (implemented):** `add`, `list`, `get`, `update`, and
   `delete` use the locked persistence service. IDs are stable and independent of
   titles; list output excludes fields, and get masks sensitive fields by default.
-- **backup**: encrypted copy to a new unique path; never overwrite.
-- **restore**: write a new vault to a new path; never overwrite.
+- **backup (implemented):** captures one locked, authenticated source snapshot
+  and publishes its exact encrypted bytes to a new no-clobber path.
+- **restore (implemented):** authenticates a backup snapshot and publishes its
+  exact encrypted bytes only to a new path; it refuses the active vault and
+  detectable aliases, and never switches the active vault.
 - **Permissions**: directory `0700`, file `0600`; warn on open permissions.
 - **Atomicity**: temp file in the same directory, `O_EXCL`, `fsync` file and
   directory, no-clobber `link` for new destinations, `os.replace` for updates.
@@ -151,9 +153,10 @@ profile and single AEAD. Strictly versioned; unknown versions refused.
 - **Recovery disabled in v1.** No recovery key, escrow, security question,
   alternate path, or hidden slot. Losing the master password means the vault is
   **unrecoverable**; this is stated in the README and printed by `vault init`.
-- Backups are encrypted snapshots. Backups taken **before** a password change
-  require the **old** password; backups taken after require the new one.
-- Restore never overwrites; the user must move the existing file aside first.
+- Backups are encrypted snapshots and require the same master password as their
+  source at backup time. Password change is not implemented.
+- Restore never overwrites or switches the active vault; it also rejects the
+  active vault path and detectable aliases.
 - A future opt-in recovery-key slot was considered and is deliberately **not**
   added now; it would require explicit approval and a separate design.
 
@@ -170,12 +173,11 @@ vaultforge vault update   ENTRY_ID [--vault PATH] [--title S] [--field NAME]
 vaultforge vault delete   ENTRY_ID [--vault PATH]  # confirmation required
 vaultforge vault backup   [--vault PATH] [--out PATH]
 vaultforge vault restore  --backup PATH --out PATH
-vaultforge vault validate [--vault PATH]
 ```
 
 - Default vault path `~/.vaultforge/vault.vf`; directory created `0700`.
-- Secret input: hidden prompt by default; `--from-file` for bulk fields; never
-  via argv; environment variables are not used for the master password.
+- Secret input: hidden prompt; never via argv; environment variables are not
+  used for the master password.
 - Secret output: stdout only; prompts/warnings to stderr; masked unless
   `--reveal`; errors never include material.
 - Data model: `Vault` (schema + entries); entries have a random 128-bit hex
@@ -188,8 +190,8 @@ vaultforge vault validate [--vault PATH]
 - No rollback protection in v1.
 - Entry count/size metadata is not hidden (no padding in v1).
 - Per-invocation password prompts (no agent) affect ergonomics.
-- Backup password policy (shared vs independent) deferred; v1 uses the vault
-  password at backup time.
+- Backups use the vault password at backup time; no independent backup password
+  system exists.
 - Whether to add optional `mlock` best-effort hardening is deferred.
 
 ## 11. Implementation roadmap and acceptance criteria
@@ -237,12 +239,12 @@ next begins. Negative tests are mandatory, not optional.
   modification** during update → `ConcurrentModificationError`; open permissions
   produce a warning; temp files are removed on failure.
 
-### M5 — Backup and restore
-- Positive: backup creates a new decryptable file; restore creates a working
-  vault at a new path.
-- Negative: backup/restore onto an **existing destination** → refused; restoring
-  over a vault requires the user to move it first; a backup made before a
-  password change fails to open with the new password and succeeds with the old.
+### M5 — Backup and restore (implemented)
+- Positive: backup captures exact encrypted vault bytes after authentication and
+  restore creates a working vault at a new path from those same bytes.
+- Negative: wrong passwords, tampered or oversized sources, existing destinations,
+  commit failures, and an active-vault path or detectable alias are refused without
+  publishing output; competing publishers can produce only one destination.
 
 ### M6 — Security and robustness tests
 - **Tampered header** (each field: version, vault_id, KDF params, salt, nonces)

@@ -11,6 +11,7 @@ from vaultforge.vault import crypto, service, store
 from vaultforge.vault import format as fmt
 from vaultforge.vault.errors import (
     AUTH_ERROR_MESSAGE,
+    ActiveVaultDestinationError,
     AuthError,
     CorruptPayloadError,
     DestinationExistsError,
@@ -79,6 +80,15 @@ def test_initialize_creates_the_parent_directory(tmp_path):
     path = tmp_path / "nested" / "dir" / "vault.vf"
     service.initialize_vault(path, PASSWORD)
     assert path.parent.is_dir()
+
+
+def test_initialize_rejects_an_empty_master_password_before_creating_files(tmp_path):
+    path = tmp_path / "nested" / "vault.vf"
+
+    with pytest.raises(ValueError, match="master password must not be empty"):
+        service.initialize_vault(path, b"")
+
+    assert not path.parent.exists()
 
 
 def test_unlock_with_the_wrong_password_is_an_auth_error(sample, tmp_path):
@@ -422,6 +432,165 @@ def test_update_vault_replacement_keeps_private_file_permissions(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
     lock_path = path.with_name(f".{path.name}.lock")
     assert stat.S_IMODE(lock_path.stat().st_mode) & 0o077 == 0
+
+
+def test_backup_copies_exact_authenticated_ciphertext_and_restores_it(tmp_path):
+    source = tmp_path / "vault.vf"
+    backup = tmp_path / "backup.vf"
+    restored = tmp_path / "restored.vf"
+    service.initialize_vault(source, PASSWORD)
+    service.add_entry(
+        source, PASSWORD, entry_type="note", title="Memo", fields={"body": "plaintext sentinel"}
+    )
+
+    assert service.backup_vault(source, PASSWORD, backup) == backup
+    assert backup.read_bytes() == source.read_bytes()
+    assert b"plaintext sentinel" not in backup.read_bytes()
+    assert service.unlock_vault(backup, PASSWORD) == service.unlock_vault(source, PASSWORD)
+
+    assert service.restore_vault(backup, PASSWORD, restored, active_vault=source) == restored
+    assert restored.read_bytes() == backup.read_bytes()
+    assert service.unlock_vault(restored, PASSWORD) == service.unlock_vault(source, PASSWORD)
+
+
+def test_backup_authentication_or_validation_failures_publish_nothing(tmp_path, monkeypatch):
+    source = tmp_path / "vault.vf"
+    output = tmp_path / "backup.vf"
+    service.initialize_vault(source, PASSWORD)
+
+    with pytest.raises(AuthError):
+        service.backup_vault(source, b"wrong", output)
+    assert not output.exists()
+
+    data = bytearray(source.read_bytes())
+    data[-1] ^= 1
+    source.write_bytes(data)
+    with pytest.raises(AuthError):
+        service.backup_vault(source, PASSWORD, output)
+    assert not output.exists()
+    assert list(tmp_path.glob(".vaultforge-*")) == []
+
+    monkeypatch.setattr(fmt, "MAX_FILE_LEN", 150)
+    monkeypatch.setattr(store, "MAX_FILE_LEN", 150)
+    with pytest.raises(InvalidVaultError):
+        service.backup_vault(source, PASSWORD, output)
+    assert not output.exists()
+
+
+def test_backup_preserves_existing_destination_and_cleans_up_commit_failure(tmp_path, monkeypatch):
+    source = tmp_path / "vault.vf"
+    output = tmp_path / "backup.vf"
+    service.initialize_vault(source, PASSWORD)
+    output.write_bytes(b"existing backup")
+    with pytest.raises(DestinationExistsError):
+        service.backup_vault(source, PASSWORD, output)
+    assert output.read_bytes() == b"existing backup"
+
+    output.unlink()
+
+    def fail_commit(temp, path):
+        raise OSError("fail")
+
+    monkeypatch.setattr(store, "_commit_no_clobber", fail_commit)
+    with pytest.raises(OSError, match="fail"):
+        service.backup_vault(source, PASSWORD, output)
+    assert not output.exists()
+    assert list(tmp_path.glob(".vaultforge-*")) == []
+
+
+def test_generated_backup_path_is_new_and_has_private_permissions(tmp_path):
+    source = tmp_path / "vault.vf"
+    service.initialize_vault(source, PASSWORD)
+
+    backup = service.backup_vault(source, PASSWORD)
+
+    assert backup.parent == source.parent
+    assert backup.suffix == ".vf"
+    assert backup.read_bytes() == source.read_bytes()
+    if os.name == "posix":
+        assert stat.S_IMODE(backup.stat().st_mode) & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink permissions vary on Windows")
+def test_restore_refuses_existing_destination_and_active_vault_alias(tmp_path):
+    source = tmp_path / "vault.vf"
+    backup = tmp_path / "backup.vf"
+    destination = tmp_path / "restored.vf"
+    service.initialize_vault(source, PASSWORD)
+    service.backup_vault(source, PASSWORD, backup)
+
+    destination.write_bytes(b"existing destination")
+    with pytest.raises(DestinationExistsError):
+        service.restore_vault(backup, PASSWORD, destination, active_vault=source)
+    assert destination.read_bytes() == b"existing destination"
+
+    with pytest.raises(ActiveVaultDestinationError):
+        service.restore_vault(backup, PASSWORD, source, active_vault=source)
+    alias = tmp_path / "active-alias.vf"
+    alias.symlink_to(source)
+    with pytest.raises(ActiveVaultDestinationError):
+        service.restore_vault(backup, PASSWORD, alias, active_vault=source)
+
+
+def test_backup_during_a_cooperating_mutation_captures_one_complete_vault(tmp_path):
+    source = tmp_path / "vault.vf"
+    backup = tmp_path / "backup.vf"
+    service.initialize_vault(source, PASSWORD)
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def create_backup():
+        try:
+            barrier.wait(timeout=10)
+            service.backup_vault(source, PASSWORD, backup)
+        except Exception as exc:  # surfaced in the main test thread
+            errors.append(exc)
+
+    def add_entry():
+        try:
+            barrier.wait(timeout=10)
+            service.add_entry(
+                source, PASSWORD, entry_type="note", title="Concurrent", fields={"body": "value"}
+            )
+        except Exception as exc:  # surfaced in the main test thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create_backup), threading.Thread(target=add_entry)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    entries = service.unlock_vault(backup, PASSWORD)["entries"]
+    assert [entry["title"] for entry in entries] in ([], ["Concurrent"])
+
+
+def test_backup_concurrent_publishers_leave_one_complete_snapshot(tmp_path):
+    source = tmp_path / "vault.vf"
+    output = tmp_path / "backup.vf"
+    service.initialize_vault(source, PASSWORD)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def backup():
+        try:
+            barrier.wait(timeout=10)
+            service.backup_vault(source, PASSWORD, output)
+            results.append("created")
+        except DestinationExistsError:
+            results.append("exists")
+
+    threads = [threading.Thread(target=backup), threading.Thread(target=backup)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(results) == ["created", "exists"]
+    assert service.unlock_vault(output, PASSWORD) == EMPTY_VAULT
 
 
 def test_initialize_leaves_no_partial_vault_when_the_commit_fails(tmp_path, monkeypatch):

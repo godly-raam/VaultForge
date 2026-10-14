@@ -12,6 +12,7 @@ from __future__ import annotations
 
 __all__ = [
     "AUTH_ERROR_MESSAGE",
+    "ActiveVaultDestinationError",
     "AuthError",
     "ConcurrentModificationError",
     "CorruptPayloadError",
@@ -86,6 +87,10 @@ class CorruptPayloadError(PayloadValidationError):
 
 class DestinationExistsError(VaultError):
     """A destination path already exists; the operation refuses to overwrite it."""
+
+
+class ActiveVaultDestinationError(VaultError):
+    """Restore output resolves to the active vault or a detectable alias of it."""
 
 
 class DuplicateEntryError(VaultError):

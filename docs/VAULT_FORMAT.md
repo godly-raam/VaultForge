@@ -134,17 +134,11 @@ fails authentication.
 is corrupted or has been tampered with." The tags cannot distinguish the two
 causes, so the tool must never claim it knows which occurred.
 
-### 5.3 Password change (write, full rewrite)
-Changing the master password is a **full re-encryption**, written atomically:
-1. Verify the old password (unwrap DEK, verify body tag).
-2. Generate a **new** `argon2_salt`, new `KEK`, new `DEK`, new `wrap_nonce`,
-   and new `body_nonce`.
-3. Re-encrypt the payload under the new DEK, wrap the new DEK under the new KEK,
-   and replace the vault atomically.
-Consequences (must be documented in CLI output):
-- Existing **backups keep their old password**; they are snapshots and are not
-  re-keyed when the vault password changes.
-- After a password change, all new backups must be made with the new password.
+### 5.3 Password change
+Password change is **not implemented in v1**. A future design must perform a
+full authenticated re-encryption with a new salt, KEK, DEK, and nonces, and must
+preserve the fact that existing encrypted backups would retain their prior
+password. It must not alter the frozen v1 layout without an approved migration.
 
 ## 6. Payload schema (inside the AEAD)
 
@@ -217,13 +211,13 @@ anywhere. Only `json.loads`.
   (do not silently proceed as if secure). Windows ACL limitations are documented.
 
 ### 8.2 Atomic write with no-clobber (init, backup, restore)
-1. Create a temp file in the **same directory** as the destination using
-   `os.open(tmp, O_CREAT|O_EXCL|O_WRONLY, 0o600)`.
+1. Create a private temp file in the **same directory** as the destination
+   using `tempfile.mkstemp` (exclusive creation, mode `0600`).
 2. Write the full buffer; `flush`; `os.fsync(fd)`; close.
 3. Commit without overwriting using an atomic no-clobber primitive:
    `os.link(tmp, target)` — this raises `FileExistsError` if `target` already
-   exists, atomically. (Fallback where hardlinks are unavailable:
-   `os.open(target, O_CREAT|O_EXCL|O_WRONLY)` as a reservation, then rename.)
+   exists, atomically. VaultForge fails closed with `UnsupportedFilesystemError`
+   when hard links are unavailable; it does not use a weaker fallback.
 4. `os.fsync` the directory; unlink the temp file.
 
 If the destination exists at step 3, the operation fails with
@@ -253,25 +247,28 @@ this is not the prohibited "silent overwrite of a destination."
 ### 8.4 Race-condition review
 - Temp files are created with `O_EXCL` in the destination directory, so two
   concurrent writers cannot share a temp name.
-- No-clobber commit (`link`/`O_EXCL`) means two concurrent `init`/`backup` calls
-  targeting the same path cannot both succeed.
-- The CAS check ensures an update cannot overwrite a vault that changed after it
-  was read.
-- `os.replace` is atomic, so readers never observe a partially written file.
+- No-clobber commit (`link`) means two concurrent `init`/`backup` calls targeting
+  the same path cannot both succeed.
+- The CAS check detects a changed vault immediately before replacement, but it is
+  not a universal transaction: an external writer can still race that check, and
+  advisory locks do not control non-cooperating programs or all network filesystems.
+- `os.replace` is atomic on supported local filesystems, so readers do not observe
+  a partially written replacement there.
 
 ## 9. Backup and restore
 
 - **Backup (`vault backup --out PATH`)**: writes an encrypted copy of the vault
   to a **new** path using section 8.2 (no-clobber). If `--out` is omitted, a
-  unique name is generated (`vault-YYYYMMDDTHHMMSSZ-<4 random hex>.vf`). The
+  unique name is generated (`vault-YYYYMMDDTHHMMSSZ-<32 random hex>.vf`). The
   backup uses the **same** master password as the vault at the time it is made.
-- **After a password change**, previous backups remain decryptable only with the
-  **old** password. This is documented and surfaced by `vault backup`.
-- **Restore (`vault restore --backup B --out PATH`)**: decrypts `B` and writes a
-  new vault to `PATH` using section 8.2 (no-clobber). If `PATH` exists, the
-  operation fails with `DestinationExistsError`; restoring over an existing vault
-  is never done automatically. The user must move or rename the existing file
-  themselves first.
+- Password change is not implemented. If added in a future approved design,
+  existing backups must remain decryptable only with their prior password.
+- **Restore (`vault restore --backup B --out PATH`)**: authenticates `B` and
+  writes its exact captured encrypted bytes to a new `PATH` using section 8.2
+  (no-clobber). If `PATH` exists, the operation fails with
+  `DestinationExistsError`; a path resolving to the active vault, or a detectable
+  filesystem alias of it, is also refused. Restore never switches the active vault
+  or overwrites it; the user must choose a new path and explicitly move files later.
 
 ## 10. Locking and `unlock` semantics (v1)
 
@@ -304,6 +301,7 @@ this is not the prohibited "silent overwrite of a destination."
 | Wrong password / tampered wrap or body | `AuthError` | Single unified message. |
 | Valid crypto but malformed payload JSON/schema | `CorruptPayloadError` | After successful decrypt. |
 | Destination exists (init/backup/restore) | `DestinationExistsError` | No overwrite. |
+| Restore output is the active vault or detectable alias | `ActiveVaultDestinationError` | No active-vault replacement. |
 | Concurrent modification during update | `ConcurrentModificationError` | CAS failure. |
 
 No error message, log record, or traceback may contain a secret, the master
