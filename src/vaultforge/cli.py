@@ -9,6 +9,8 @@ they are never written to a log, a file, or an error stream.
 from __future__ import annotations
 
 import json
+import os
+import re
 from enum import Enum
 from pathlib import Path
 
@@ -371,6 +373,23 @@ def otp_uri(
 
 _EXIT_AUTH_FAILURE = 1
 _EXIT_ERROR = 2
+_ENTRY_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_EDITABLE_ENTRY_FIELDS = frozenset(
+    {
+        "username",
+        "password",
+        "url",
+        "notes",
+        "secret",
+        "digits",
+        "period",
+        "algorithm",
+        "issuer",
+        "account",
+        "codes",
+        "body",
+    }
+)
 
 vault_app = typer.Typer(
     help="Create and open the local encrypted vault.",
@@ -381,7 +400,10 @@ app.add_typer(vault_app, name="vault")
 
 
 def _vault_path(vault: Path | None) -> Path:
-    return vault if vault is not None else vault_service.default_vault_path()
+    if vault is not None:
+        return vault
+    environment_path = os.environ.get("VAULTFORGE_VAULT")
+    return Path(environment_path) if environment_path else vault_service.default_vault_path()
 
 
 def _prompt_new_password() -> bytes:
@@ -402,6 +424,12 @@ def _prompt_new_password() -> bytes:
 
 def _prompt_password() -> bytes:
     return typer.prompt("Master password", hide_input=True, default="", err=True).encode("utf-8")
+
+
+def _validate_entry_id(entry_id: str) -> str:
+    if not _ENTRY_ID_RE.fullmatch(entry_id):
+        raise typer.BadParameter("entry ID must be 32 lowercase hexadecimal characters")
+    return entry_id
 
 
 @vault_app.command("init")
@@ -452,6 +480,7 @@ def vault_add(
 
 @vault_app.command("list")
 def vault_list(
+    json_output: bool = typer.Option(False, "--json", help="Print non-sensitive metadata as JSON."),
     vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
 ) -> None:
     """List entry IDs and non-sensitive metadata only."""
@@ -467,7 +496,32 @@ def vault_list(
         {key: entry[key] for key in ("id", "type", "title", "tags", "created_at", "updated_at")}
         for entry in entries
     ]
-    typer.echo(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+    if json_output:
+        typer.echo(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+    elif not metadata:
+        typer.echo("No entries found.")
+    else:
+        typer.echo(_format_entry_table(metadata))
+
+
+def _format_entry_table(entries: list[dict[str, object]]) -> str:
+    headers = ("Title", "Type", "ID")
+    rows = [
+        (json.dumps(entry["title"], ensure_ascii=False)[1:-1], entry["type"], entry["id"])
+        for entry in entries
+    ]
+    widths = [
+        max(len(str(value)) for value in column) for column in zip(headers, *rows, strict=True)
+    ]
+    lines = [
+        "  ".join(str(value).ljust(width) for value, width in zip(headers, widths, strict=True))
+    ]
+    lines.append("  ".join("-" * width for width in widths))
+    lines.extend(
+        "  ".join(str(value).ljust(width) for value, width in zip(row, widths, strict=True))
+        for row in rows
+    )
+    return "\n".join(lines)
 
 
 @vault_app.command("get")
@@ -477,6 +531,7 @@ def vault_get(
     vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
 ) -> None:
     """Retrieve an entry by stable ID; sensitive fields are masked by default."""
+    entry_id = _validate_entry_id(entry_id)
     try:
         entry = vault_service.get_entry(_vault_path(vault), _prompt_password(), entry_id)
     except AuthError as exc:
@@ -491,7 +546,23 @@ def vault_get(
             if key in fields:
                 fields[key] = "********"
         entry = {**entry, "fields": fields}
-    typer.echo(json.dumps(entry, sort_keys=True, separators=(",", ":")))
+    typer.echo(_format_entry(entry))
+
+
+def _format_entry(entry: dict[str, object]) -> str:
+    metadata_keys = ("id", "title", "type", "tags", "created_at", "updated_at")
+    lines = ["Metadata:"]
+    lines.extend(f"  {key}: {_format_entry_value(entry[key])}" for key in metadata_keys)
+    lines.append("Fields:")
+    fields = entry["fields"]
+    if not isinstance(fields, dict):
+        raise ValueError("entry fields are invalid")
+    lines.extend(f"  {key}: {_format_entry_value(value)}" for key, value in sorted(fields.items()))
+    return "\n".join(lines)
+
+
+def _format_entry_value(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 @vault_app.command("update")
@@ -504,6 +575,9 @@ def vault_update(
     """Update an entry title and/or one prompted field without changing its ID."""
     if title is None and field is None:
         raise typer.BadParameter("provide --title and/or --field")
+    entry_id = _validate_entry_id(entry_id)
+    if field is not None and field not in _EDITABLE_ENTRY_FIELDS:
+        raise typer.BadParameter("unsupported entry field")
     field_updates = {field: _prompt_entry_field_value(field)} if field is not None else None
     try:
         vault_service.update_entry(
@@ -524,6 +598,7 @@ def vault_delete(
     vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
 ) -> None:
     """Delete an entry after explicit interactive confirmation."""
+    entry_id = _validate_entry_id(entry_id)
     if not typer.confirm(f"Delete entry {entry_id}?", default=False):
         typer.echo("cancelled", err=True)
         return

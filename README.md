@@ -95,16 +95,23 @@ vaultforge vault init
 # Vault: create it somewhere else
 vaultforge vault init --vault /path/to/my.vault
 
+# Vault: set a default path for vault commands; --vault still takes precedence
+export VAULTFORGE_VAULT=/path/to/my.vault
+vaultforge vault list
+
 # Vault: verify the master password and open it (one-shot; no session is kept)
 vaultforge vault unlock
 
 # Vault: add a login (sensitive values are requested through hidden prompts)
 vaultforge vault add --type login --title Example --vault /path/to/my.vault
 
-# Vault: list non-sensitive entry metadata
+# Vault: list non-sensitive entries in a readable table
 vaultforge vault list --vault /path/to/my.vault
 
-# Vault: retrieve by stable entry ID (sensitive fields masked by default)
+# Vault: request non-sensitive metadata as JSON for scripts
+vaultforge vault list --json --vault /path/to/my.vault
+
+# Vault: retrieve by stable entry ID (readable metadata and fields; sensitive values masked)
 vaultforge vault get ENTRY_ID --vault /path/to/my.vault
 
 # Vault: explicitly reveal sensitive fields
@@ -169,8 +176,8 @@ python -m vaultforge password --length 16
 | `vault init` | `--vault` | `~/.vaultforge/vault.vf` | Create a new vault (refuses an existing file). |
 | `vault unlock` | `--vault` | `~/.vaultforge/vault.vf` | Verify the master password once and exit. |
 | `vault add` | `--type`, `--title`, `--vault` | required, required, default path | Add a typed entry; sensitive fields are prompted. |
-| `vault list` | `--vault` | default path | List stable IDs and non-sensitive metadata. |
-| `vault get` | `ENTRY_ID`, `--reveal`, `--vault` | required, off, default path | Retrieve by ID; sensitive fields are masked unless revealed. |
+| `vault list` | `--json`, `--vault` | table, default path | List stable IDs, titles, and types; use `--json` for metadata. |
+| `vault get` | `ENTRY_ID`, `--reveal`, `--vault` | required, off, default path | Display readable metadata and fields; sensitive fields are masked unless revealed. |
 | `vault update` | `ENTRY_ID`, `--title`, `--field`, `--vault` | required, optional, optional, default path | Rename and/or update one prompted field; ID remains stable. |
 | `vault delete` | `ENTRY_ID`, `--vault` | required, default path | Delete after interactive confirmation. |
 | `vault backup` | `--vault`, `--out` | default path, generated sibling path | Authenticate and copy exact encrypted bytes to a new path. |
@@ -185,8 +192,10 @@ The `vault` commands read the master password from a hidden prompt (never from
 the command line) and keep the prompt, warnings, and status messages on
 **stderr**. Sensitive entry values are not accepted as command-line arguments;
 entry fields are prompted for, and `get` masks password, TOTP secret, recovery
-codes, notes, and note bodies unless `--reveal` is given. Listing prints only IDs
-and metadata. Delete requires interactive confirmation. `vault init` refuses to
+codes, notes, and note bodies unless `--reveal` is given; its output separates
+metadata from fields. Listing prints stable IDs, titles, and types in a readable
+table; use `vault list --json` for non-sensitive metadata. Delete requires
+interactive confirmation. `vault init` refuses to
 overwrite an existing file and writes it with `0600` permissions; it also warns
 that **recovery is disabled** -- if the master password is lost, the vault cannot
 be opened. `vault backup` authenticates and copies exact encrypted vault bytes to
