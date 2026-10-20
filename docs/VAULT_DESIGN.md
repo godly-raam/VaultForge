@@ -11,16 +11,19 @@ and encrypted backup/restore are built; later milestones remain unimplemented.
 
 ---
 
-## 1. Repository baseline (verified this session)
+## 1. Project configuration
 
-- Git branch `master`, one commit `6feda20`; all current work is **untracked**.
-- Python 3.11.2; project floor `requires-python = ">=3.10"`; CI matrix 3.10–3.13.
-- Installed: typer 0.27.3, pytest 9.1.1, ruff 0.17.0, mypy 2.4.0, PyOTP 2.10.0,
-  cryptography 46.0.7 (OpenSSL 3.5.6). Latest cryptography on PyPI is 50.0.2.
-- Checks rerun at implementation time: **292 passed**, `ruff check` clean,
-  `ruff format --check` clean, `mypy` clean (13 source files).
-- `cryptography` is now a declared runtime dependency (`cryptography>=44`) in
-  `pyproject.toml`.
+- Python support is declared as `>=3.10` in `pyproject.toml`. The GitHub Actions
+  workflow runs the quality suite on Ubuntu for Python 3.10–3.13.
+- Runtime dependencies are declared as version ranges: `typer>=0.9` and
+  `cryptography>=44`; TOTP support is the optional `pyotp>=2.9,<3` extra.
+- Development tools are also installed from version ranges. The repository has no
+  lockfile, dependency hashes, or immutable action commit references. CI installs
+  `.[dev]` and uses major-version action tags, so dependency resolution and action
+  revisions are not fully reproducible from this repository alone.
+- Exact branch state, installed package versions, and test counts are deliberately
+  not recorded here because they change over time. Consult the repository, the
+  active environment, and CI run results for current values.
 
 ## 2. Scope
 
@@ -60,10 +63,10 @@ malware as the same user. Assumed unable to break Argon2id or ChaCha20-Poly1305.
 | Malformed/malicious file | Fixed binary header, strict ordered validation, JSON only | Parser bugs |
 | Corruption/truncation | Size gate + tags + distinct errors | Loss without a backup |
 | Secret leakage in logs/errors | No secret logging; unified sanitized errors; stdout-only secrets | Shell history, scrollback, `ps` |
-| Overly open permissions | `0600`/`0700`; warn on group/other access | User may relax permissions |
+| Overly open permissions | Request `0600`/`0700`; POSIX warning for group/other access | User may relax permissions; Windows ACL semantics differ |
 | Backup/sync copies | Encrypted backups, unique names, no overwrite | Cloud/sync tools keep old copies |
 | Memory/swap/core dumps | Best-effort `bytearray` reuse | Python cannot reliably zeroize |
-| Supply chain | Minimal deps; pinned; hashes in CI | Upstream compromise |
+| Supply chain | Declared runtime dependencies and CI quality checks | No lockfile, dependency hashes, or immutable action references; upstream compromise or changed resolution remains a risk |
 | KDF/DoS | Strict bounds checked before Argon2id/allocation | Attacker forces max allowed work |
 | Compromised OS / malware as user | None effective | Out of scope |
 
@@ -81,12 +84,12 @@ copies retained by backups and sync tools.
 
 ## 4. Cryptographic decisions
 
-- **Dependency: `cryptography`** (Apache-2.0 OR BSD-3-Clause; actively
-  maintained; Rust-backed; already exposes the required APIs). `argon2-cffi` is
-  a credible alternative but would add a second crypto dependency; not chosen.
+- **Dependency: `cryptography>=44`** is the declared runtime dependency that
+  provides Argon2id and ChaCha20-Poly1305. The installed version is selected by
+  the package resolver; this repository does not pin it with a lockfile or hash.
+  `argon2-cffi` would add a second crypto dependency and is not used.
 - **KDF: Argon2id** (RFC 9106), fixed v1 profile `m=65536 KiB, t=3, p=1`,
-  32-byte output. Measured on this machine: ~64 ms (19 MiB/t=2), ~347 ms
-  (64 MiB/t=3), ~1960 ms (256 MiB/t=4). 64 MiB/t=3 is a deliberate balance.
+  32-byte output. Performance depends on the user's hardware and environment.
 - **AEAD: ChaCha20-Poly1305** (RFC 8439) for both the DEK wrap and the body.
   Chosen over AES-256-GCM for constant-time behavior in software, portability,
   and a simple 12-byte-nonce requirement. **No algorithm agility in v1.**
@@ -137,9 +140,13 @@ profile and single AEAD. Strictly versioned; unknown versions refused.
 - **restore (implemented):** authenticates a backup snapshot and publishes its
   exact encrypted bytes only to a new path; it refuses the active vault and
   detectable aliases, and never switches the active vault.
-- **Permissions**: directory `0700`, file `0600`; warn on open permissions.
-- **Atomicity**: temp file in the same directory, `O_EXCL`, `fsync` file and
-  directory, no-clobber `link` for new destinations, `os.replace` for updates.
+- **Permissions**: new directories and files request `0700` and `0600` modes.
+  POSIX permission checks warn on group/other-readable vaults; Windows ACL
+  semantics are platform-dependent.
+- **Atomicity**: temp files are created in the destination directory, then file
+  data is flushed and `fsync`ed before no-clobber `link` publication for new
+  destinations or `os.replace` for updates. Directory `fsync` is best effort
+  because it is not supported by every platform or filesystem.
 - **Concurrency**: VaultForge updates serialize through an advisory sibling lock
   and verify a snapshot (device, inode, size, mtime_ns, SHA-256) before replace.
   This prevents lost updates among cooperating VaultForge writers and detects
@@ -175,7 +182,10 @@ vaultforge vault backup   [--vault PATH] [--out PATH]
 vaultforge vault restore  --backup PATH --out PATH
 ```
 
-- Default vault path `~/.vaultforge/vault.vf`; directory created `0700`.
+- Default vault path `~/.vaultforge/vault.vf`; `VAULTFORGE_VAULT` supplies the
+  default for commands with `--vault` when that option is omitted. New
+  directories request `0700` permissions where the platform supports POSIX mode
+  bits.
 - Secret input: hidden prompt; never via argv; environment variables are not
   used for the master password.
 - Secret output: stdout only; prompts/warnings to stderr; masked unless
@@ -231,7 +241,7 @@ next begins. Negative tests are mandatory, not optional.
   rejected as malformed payloads to keep ID-based operations unambiguous.
 
 ### M4 — Persistence, permissions, concurrency (safe persistence foundation implemented)
-- Positive: file mode `0600`, directory `0700`; interrupted replacement (simulated
+- Positive: POSIX tests cover restrictive file and directory permissions; interrupted replacement (simulated
   failure before commit) leaves the original byte-for-byte intact. Store/service
   primitives implement secure temporary writes, locking, snapshot checks, and
   atomic replacement; M3 CRUD now uses this persistence path.
@@ -246,7 +256,10 @@ next begins. Negative tests are mandatory, not optional.
   commit failures, and an active-vault path or detectable alias are refused without
   publishing output; competing publishers can produce only one destination.
 
-### M6 — Security and robustness tests
+### M6 — Security and robustness tests (planned)
+
+Additional planned coverage includes (some related tests already exist):
+
 - **Tampered header** (each field: version, vault_id, KDF params, salt, nonces)
   → `AuthError` or `InvalidVaultError` as appropriate.
 - **Tampered wrapped key** → `AuthError`.
@@ -262,18 +275,6 @@ next begins. Negative tests are mandatory, not optional.
 - **Leakage**: no secret in stdout/stderr/logs/exceptions; an AST/`secrets`-spy
   test proving vault code uses `secrets`, never `random`.
 
-### M7 — Focused security review
+### M7 — Focused security review (planned)
 - Independent review of parsing, bounds, AAD construction, permission handling,
   and error wording; a small fuzz pass over the header parser.
-
-## 12. Files to be created or modified (implementation phase)
-
-Created: `src/vaultforge/vault/{__init__,crypto,format,payload,errors}.py` (M1),
-`src/vaultforge/vault/{store,service}.py` (M2); and, in later milestones,
-`model.py`; plus `tests/test_vault_{crypto,format,payload}.py` (M1),
-`tests/test_vault_{store,service,cli}.py` (M2), and later
-`test_vault_security.py`; this document and `docs/VAULT_FORMAT.md`.
-
-Modified: `pyproject.toml` (add `cryptography`, extras, ruff notes),
-`src/vaultforge/limits.py` (vault/KDF bounds), `src/vaultforge/cli.py` (register
-the `vault` sub-app), and `README.md` (vault docs and the no-recovery warning).

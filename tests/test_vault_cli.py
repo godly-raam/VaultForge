@@ -6,6 +6,9 @@ from typer.testing import CliRunner
 
 from vaultforge import cli
 from vaultforge.cli import app
+from vaultforge.vault import crypto
+from vaultforge.vault import format as vault_format
+from vaultforge.vault import service as vault_service
 
 runner = CliRunner()
 
@@ -391,6 +394,106 @@ def test_vault_add_invalid_totp_value_does_not_persist_or_echo_secrets(tmp_path)
     assert "totp-secret" not in invalid.stdout + _stderr(invalid)
     assert "Traceback" not in invalid.stdout + _stderr(invalid)
     assert path.read_bytes() == original
+
+
+def test_vault_get_masks_each_sensitive_schema_field_until_revealed(tmp_path):
+    path = tmp_path / "vault.vf"
+    assert _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD]).exit_code == 0
+    entries = (
+        (
+            "login",
+            "Sentinel login",
+            [
+                "sentinel-login-user",
+                "sentinel-login-password",
+                "",
+                "sentinel-login-notes",
+                PASSWORD,
+            ],
+            ("sentinel-login-password", "sentinel-login-notes"),
+            2,
+        ),
+        (
+            "totp",
+            "Sentinel TOTP",
+            ["sentinel-totp-secret", "6", "30", "sha1", "", "", PASSWORD],
+            ("sentinel-totp-secret",),
+            1,
+        ),
+        (
+            "recovery",
+            "Sentinel recovery",
+            ["sentinel-recovery-code-one,sentinel-recovery-code-two", PASSWORD],
+            ("sentinel-recovery-code-one", "sentinel-recovery-code-two"),
+            1,
+        ),
+        ("note", "Sentinel note", ["sentinel-note-body", PASSWORD], ("sentinel-note-body",), 1),
+    )
+
+    for entry_type, title, prompt_values, sensitive_values, mask_count in entries:
+        added = _invoke(
+            ["vault", "add", "--type", entry_type, "--title", title, "--vault", str(path)],
+            prompt_values,
+        )
+        assert added.exit_code == 0, _stderr(added)
+        entry_id = _stderr(added).split("added entry ", 1)[1].strip()
+
+        masked = _invoke(["vault", "get", entry_id, "--vault", str(path)], [PASSWORD])
+        masked_output = masked.stdout + _stderr(masked)
+        assert masked.exit_code == 0, _stderr(masked)
+        assert f'id: "{entry_id}"' in masked.stdout
+        assert f'title: "{title}"' in masked.stdout
+        assert masked.stdout.count('"********"') == mask_count
+        for value in sensitive_values:
+            assert value not in masked_output
+
+        revealed = _invoke(["vault", "get", entry_id, "--reveal", "--vault", str(path)], [PASSWORD])
+        assert revealed.exit_code == 0, _stderr(revealed)
+        for value in sensitive_values:
+            assert value in revealed.stdout
+
+
+def test_vault_cli_failure_does_not_echo_secrets_from_tampered_or_malformed_payloads(tmp_path):
+    path = tmp_path / "vault.vf"
+    sentinel = "sentinel-decrypted-payload-secret"
+    assert _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD]).exit_code == 0
+    added = _invoke(
+        ["vault", "add", "--type", "note", "--title", "Tampered", "--vault", str(path)],
+        [sentinel, PASSWORD],
+    )
+    entry_id = _stderr(added).split("added entry ", 1)[1].strip()
+
+    original = path.read_bytes()
+    tampered = bytearray(original)
+    tampered[-1] ^= 1
+    path.write_bytes(tampered)
+    corrupted = _invoke(["vault", "get", entry_id, "--vault", str(path)], [PASSWORD])
+    corrupted_output = corrupted.stdout + _stderr(corrupted)
+    assert corrupted.exit_code == 1
+    assert "authentication failed" in corrupted_output
+    assert sentinel not in corrupted_output
+    assert "Traceback" not in corrupted_output
+
+    header = vault_format.parse_header(original)
+    password = PASSWORD.encode("utf-8")
+    kek = bytearray(crypto.derive_kek(password, header.salt))
+    try:
+        malformed = vault_service._encrypt_payload_bytes(
+            bytearray(json.dumps({"schema": 1, "entries": [], "secret": sentinel}).encode("utf-8")),
+            kek,
+            vault_id=header.vault_id,
+            salt=header.salt,
+        )
+    finally:
+        crypto.wipe(kek)
+    path.write_bytes(malformed)
+
+    invalid = _invoke(["vault", "list", "--vault", str(path)], [PASSWORD])
+    invalid_output = invalid.stdout + _stderr(invalid)
+    assert invalid.exit_code == 2
+    assert "payload contains unknown top-level keys" in invalid_output
+    assert sentinel not in invalid_output
+    assert "Traceback" not in invalid_output
 
 
 def test_vault_backup_and_restore_create_encrypted_new_files(tmp_path):
