@@ -549,6 +549,38 @@ def vault_get(
     typer.echo(_format_entry(entry))
 
 
+@vault_app.command("totp")
+def vault_totp(
+    entry_id: str,
+    vault: Path | None = typer.Option(None, "--vault", help="Path to the vault file."),
+) -> None:
+    """Print the current TOTP code for a TOTP entry by stable ID."""
+    entry_id = _validate_entry_id(entry_id)
+    try:
+        entry = vault_service.get_entry(_vault_path(vault), _prompt_password(), entry_id)
+        if entry["type"] != VaultEntryType.totp.value:
+            raise ValueError("entry is not a TOTP entry")
+        fields = entry["fields"]
+        if not isinstance(fields, dict):
+            raise ValueError("invalid TOTP entry")
+        code = otp_lib.generate_code(
+            fields["secret"],
+            digits=fields["digits"],
+            period=fields["period"],
+            algorithm=otp_lib.Algorithm(fields["algorithm"]),
+        )
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except OTPError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    except (VaultError, OSError, KeyError, TypeError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+    typer.echo(code)
+
+
 def _format_entry(entry: dict[str, object]) -> str:
     metadata_keys = ("id", "title", "type", "tags", "created_at", "updated_at")
     lines = ["Metadata:"]

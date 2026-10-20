@@ -117,6 +117,9 @@ vaultforge vault get ENTRY_ID --vault /path/to/my.vault
 # Vault: explicitly reveal sensitive fields
 vaultforge vault get ENTRY_ID --reveal --vault /path/to/my.vault
 
+# Vault: print only the current code from a stored TOTP entry
+vaultforge vault totp ENTRY_ID --vault /path/to/my.vault
+
 # Vault: rename an entry or change one field (values are prompted)
 vaultforge vault update ENTRY_ID --title New-title --vault /path/to/my.vault
 
@@ -178,6 +181,7 @@ python -m vaultforge password --length 16
 | `vault add` | `--type`, `--title`, `--vault` | required, required, default path | Add a typed entry; sensitive fields are prompted. |
 | `vault list` | `--json`, `--vault` | table, default path | List stable IDs, titles, and types; use `--json` for metadata. |
 | `vault get` | `ENTRY_ID`, `--reveal`, `--vault` | required, off, default path | Display readable metadata and fields; sensitive fields are masked unless revealed. |
+| `vault totp` | `ENTRY_ID`, `--vault` | required, default path | Print only the current code from a stored TOTP entry. |
 | `vault update` | `ENTRY_ID`, `--title`, `--field`, `--vault` | required, optional, optional, default path | Rename and/or update one prompted field; ID remains stable. |
 | `vault delete` | `ENTRY_ID`, `--vault` | required, default path | Delete after interactive confirmation. |
 | `vault backup` | `--vault`, `--out` | default path, generated sibling path | Authenticate and copy exact encrypted bytes to a new path. |
@@ -193,9 +197,11 @@ the command line) and keep the prompt, warnings, and status messages on
 **stderr**. Sensitive entry values are not accepted as command-line arguments;
 entry fields are prompted for, and `get` masks password, TOTP secret, recovery
 codes, notes, and note bodies unless `--reveal` is given; its output separates
-metadata from fields. Listing prints stable IDs, titles, and types in a readable
-table; use `vault list --json` for non-sensitive metadata. Delete requires
-interactive confirmation. `vault init` refuses to
+metadata from fields. `vault totp ENTRY_ID` authenticates and prints only the
+current code for a TOTP entry; it never prints the stored secret or rewrites the
+vault. Listing prints stable IDs, titles, and types in a readable table; use
+`vault list --json` for non-sensitive metadata. Delete requires interactive
+confirmation. `vault init` refuses to
 overwrite an existing file and writes it with `0600` permissions; it also warns
 that **recovery is disabled** -- if the master password is lost, the vault cannot
 be opened. `vault backup` authenticates and copies exact encrypted vault bytes to

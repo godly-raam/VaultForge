@@ -1,7 +1,9 @@
 """End-to-end tests for the ``vaultforge vault`` commands."""
 
 import json
+from datetime import datetime, timezone
 
+import pytest
 from typer.testing import CliRunner
 
 from vaultforge import cli
@@ -328,6 +330,7 @@ def test_vault_commands_reject_malformed_ids_before_prompting(tmp_path):
 
     commands = (
         ["vault", "get", malformed_id, "--vault", str(path)],
+        ["vault", "totp", malformed_id, "--vault", str(path)],
         ["vault", "update", malformed_id, "--title", "Changed", "--vault", str(path)],
         ["vault", "delete", malformed_id, "--vault", str(path)],
     )
@@ -394,6 +397,85 @@ def test_vault_add_invalid_totp_value_does_not_persist_or_echo_secrets(tmp_path)
     assert "totp-secret" not in invalid.stdout + _stderr(invalid)
     assert "Traceback" not in invalid.stdout + _stderr(invalid)
     assert path.read_bytes() == original
+
+
+def test_vault_totp_prints_only_the_current_code_and_does_not_rewrite_the_vault(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "vault.vf"
+    secret = "gezd gnbv gy3t qojq gezd gnbv gy3t qojq"
+    assert _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD]).exit_code == 0
+    added = _invoke(
+        ["vault", "add", "--type", "totp", "--title", "RFC vector", "--vault", str(path)],
+        [secret, "8", "30", "sha1", "", "", PASSWORD],
+    )
+    assert added.exit_code == 0, _stderr(added)
+    entry_id = _stderr(added).split("added entry ", 1)[1].strip()
+    original = path.read_bytes()
+    monkeypatch.setattr(
+        cli.otp_lib,
+        "_coerce_time",
+        lambda _for_time: datetime.fromtimestamp(59, tz=timezone.utc),
+    )
+    monkeypatch.setattr(cli, "_prompt_password", lambda: PASSWORD.encode("utf-8"))
+
+    result = runner.invoke(app, ["vault", "totp", entry_id, "--vault", str(path)])
+
+    assert result.exit_code == 0, _stderr(result)
+    assert result.stdout == "94287082\n"
+    assert secret not in result.stdout + _stderr(result)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("entry_type", "prompt_values"),
+    [
+        ("note", ["private note", PASSWORD]),
+        ("totp", ["not-a-base32-secret!", "6", "30", "sha1", "", "", PASSWORD]),
+    ],
+)
+def test_vault_totp_fails_safely_for_wrong_type_or_invalid_secret(
+    tmp_path, monkeypatch, entry_type, prompt_values
+):
+    path = tmp_path / "vault.vf"
+    assert _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD]).exit_code == 0
+    added = _invoke(
+        ["vault", "add", "--type", entry_type, "--title", "Entry", "--vault", str(path)],
+        prompt_values,
+    )
+    assert added.exit_code == 0, _stderr(added)
+    entry_id = _stderr(added).split("added entry ", 1)[1].strip()
+    original = path.read_bytes()
+
+    monkeypatch.setattr(cli, "_prompt_password", lambda: PASSWORD.encode("utf-8"))
+    result = runner.invoke(app, ["vault", "totp", entry_id, "--vault", str(path)])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Traceback" not in _stderr(result)
+    assert "private note" not in result.stdout + _stderr(result)
+    assert "not-a-base32-secret!" not in result.stdout + _stderr(result)
+    assert path.read_bytes() == original
+
+
+def test_vault_totp_rejects_missing_entries_and_wrong_password_without_output(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "vault.vf"
+    assert _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD]).exit_code == 0
+
+    monkeypatch.setattr(cli, "_prompt_password", lambda: PASSWORD.encode("utf-8"))
+    missing = runner.invoke(app, ["vault", "totp", "f" * 32, "--vault", str(path)])
+    monkeypatch.setattr(cli, "_prompt_password", lambda: b"wrong-password")
+    wrong = runner.invoke(app, ["vault", "totp", "f" * 32, "--vault", str(path)])
+
+    assert missing.exit_code == 2
+    assert missing.stdout == ""
+    assert "entry not found" in _stderr(missing)
+    assert wrong.exit_code == 1
+    assert wrong.stdout == ""
+    assert "authentication failed" in _stderr(wrong)
+    assert "wrong-password" not in _stderr(wrong)
 
 
 def test_vault_get_masks_each_sensitive_schema_field_until_revealed(tmp_path):
@@ -539,6 +621,17 @@ def test_vault_backup_errors_do_not_echo_password_or_overwrite(tmp_path):
 def test_vault_group_help_lists_crud_and_backup_commands():
     result = runner.invoke(app, ["vault", "--help"])
     assert result.exit_code == 0
-    commands = ("init", "unlock", "add", "list", "get", "update", "delete", "backup", "restore")
+    commands = (
+        "init",
+        "unlock",
+        "add",
+        "list",
+        "get",
+        "totp",
+        "update",
+        "delete",
+        "backup",
+        "restore",
+    )
     for command in commands:
         assert command in result.stdout
