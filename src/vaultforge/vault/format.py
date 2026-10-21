@@ -246,13 +246,6 @@ def parse_header(data: bytes) -> VaultHeader:
 
     validate_kdf_params(memory_kib=memory_kib, iterations=iterations, lanes=lanes)
 
-    # Lengths are guaranteed by the slicing above; assert them defensively so a
-    # future layout edit cannot silently change what is authenticated.
-    if len(salt) != SALT_LEN or len(wrap_nonce) != NONCE_LEN or len(body_nonce) != NONCE_LEN:
-        raise InvalidVaultError("vault header has mis-sized fixed-length fields")
-    if len(wrapped_key) != WRAPPED_KEY_LEN:
-        raise InvalidVaultError("vault header has a mis-sized wrapped key")
-
     return VaultHeader(
         format_version=version,
         vault_id=vault_id,

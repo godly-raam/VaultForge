@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import math
 import secrets
 import time
 from datetime import datetime, timezone
@@ -227,7 +228,10 @@ def time_remaining(
         epoch = time.time()
     else:
         epoch = _coerce_time(for_time).timestamp()
-    return int(period - (epoch % period))
+    rem = period - (epoch % period)
+    if epoch % period == 0.0:
+        return period
+    return max(1, min(period, int(math.ceil(rem))))
 
 
 def provisioning_uri(

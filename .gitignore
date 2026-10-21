@@ -2,6 +2,8 @@
 .claude
 .gemini
 .opencode
+graphify-out/
+.graphify/
 
 # IDE and Editors
 **/.idea/

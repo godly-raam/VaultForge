@@ -399,11 +399,26 @@ vault_app = typer.Typer(
 app.add_typer(vault_app, name="vault")
 
 
+def _check_vault_permissions(path: Path) -> None:
+    try:
+        if path.exists() and vault_store.insecure_permissions(path):
+            typer.echo(
+                f"warning: {path} is readable by group/other users; "
+                f"run 'chmod 600 {path}' to restrict it.",
+                err=True,
+            )
+    except OSError:
+        pass
+
+
 def _vault_path(vault: Path | None) -> Path:
     if vault is not None:
-        return vault
-    environment_path = os.environ.get("VAULTFORGE_VAULT")
-    return Path(environment_path) if environment_path else vault_service.default_vault_path()
+        path = vault
+    else:
+        environment_path = os.environ.get("VAULTFORGE_VAULT")
+        path = Path(environment_path) if environment_path else vault_service.default_vault_path()
+    _check_vault_permissions(path)
+    return path
 
 
 def _prompt_new_password() -> bytes:
@@ -423,7 +438,11 @@ def _prompt_new_password() -> bytes:
 
 
 def _prompt_password() -> bytes:
-    return typer.prompt("Master password", hide_input=True, default="", err=True).encode("utf-8")
+    value = typer.prompt("Master password", hide_input=True, default="", err=True)
+    if not value:
+        typer.echo("error: master password must not be empty", err=True)
+        raise typer.Exit(code=_EXIT_ERROR)
+    return value.encode("utf-8")
 
 
 def _validate_entry_id(entry_id: str) -> str:
@@ -610,11 +629,20 @@ def vault_update(
     entry_id = _validate_entry_id(entry_id)
     if field is not None and field not in _EDITABLE_ENTRY_FIELDS:
         raise typer.BadParameter("unsupported entry field")
+    path = _vault_path(vault)
+    password = _prompt_password()
+    try:
+        vault_service.get_entry(path, password, entry_id)
+    except AuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
+    except (VaultError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=_EXIT_ERROR) from exc
+
     field_updates = {field: _prompt_entry_field_value(field)} if field is not None else None
     try:
-        vault_service.update_entry(
-            _vault_path(vault), _prompt_password(), entry_id, title=title, fields=field_updates
-        )
+        vault_service.update_entry(path, password, entry_id, title=title, fields=field_updates)
     except AuthError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=_EXIT_AUTH_FAILURE) from exc
@@ -736,15 +764,6 @@ def vault_unlock(
     """Verify the master password once and exit (no session is kept)."""
     path = _vault_path(vault)
     password = _prompt_password()
-    try:
-        if vault_store.insecure_permissions(path):
-            typer.echo(
-                f"warning: {path} is readable by group/other users; "
-                f"run 'chmod 600 {path}' to restrict it.",
-                err=True,
-            )
-    except OSError:
-        pass
     try:
         vault_service.unlock_vault(path, password)
     except AuthError as exc:

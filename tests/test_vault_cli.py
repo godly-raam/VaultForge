@@ -1,6 +1,7 @@
 """End-to-end tests for the ``vaultforge vault`` commands."""
 
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -158,7 +159,7 @@ def test_vault_commands_use_environment_vault_path(tmp_path):
     updated = runner.invoke(
         app,
         ["vault", "update", entry_id, "--field", "body"],
-        input=f"updated note\n{PASSWORD}\n",
+        input=f"{PASSWORD}\nupdated note\n",
         env=environment,
     )
     assert updated.exit_code == 0, _stderr(updated)
@@ -229,7 +230,7 @@ def test_vault_cli_crud_persists_and_masks_sensitive_fields(tmp_path):
             "--vault",
             str(path),
         ],
-        ["rotated-secret", PASSWORD],
+        [PASSWORD, "rotated-secret"],
     )
     assert updated.exit_code == 0, _stderr(updated)
     assert "rotated-secret" not in updated.stdout + _stderr(updated)
@@ -635,3 +636,22 @@ def test_vault_group_help_lists_crud_and_backup_commands():
     )
     for command in commands:
         assert command in result.stdout
+
+
+def test_vault_commands_reject_empty_master_password(tmp_path):
+    path = tmp_path / "vault.vf"
+    _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD])
+
+    result = _invoke(["vault", "list", "--vault", str(path)], [""])
+    assert result.exit_code == 2
+    assert "master password must not be empty" in _stderr(result)
+
+
+def test_vault_commands_warn_on_insecure_permissions(tmp_path):
+    path = tmp_path / "vault.vf"
+    _invoke(["vault", "init", "--vault", str(path)], [PASSWORD, PASSWORD])
+    os.chmod(path, 0o644)
+
+    result = _invoke(["vault", "list", "--vault", str(path)], [PASSWORD])
+    assert result.exit_code == 0
+    assert "readable by group/other users" in _stderr(result)

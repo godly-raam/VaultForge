@@ -230,3 +230,19 @@ def test_insecure_permissions_flags_group_or_other_access(tmp_path):
     assert store.insecure_permissions(target) is False
     os.chmod(target, 0o640)
     assert store.insecure_permissions(target) is True
+
+
+def test_snapshot_from_fd_raises_concurrent_modification_if_path_disappears(tmp_path):
+    from vaultforge.vault.errors import ConcurrentModificationError
+
+    target = tmp_path / "vault.vf"
+    store.write_new_vault(target, b"A" * 150)
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        target.unlink()
+        with pytest.raises(
+            ConcurrentModificationError, match="vault changed while it was being read"
+        ):
+            store._snapshot_from_fd(fd, target)
+    finally:
+        os.close(fd)

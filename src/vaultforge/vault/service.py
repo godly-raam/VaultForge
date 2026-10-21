@@ -134,12 +134,13 @@ def update_vault(
     with vault_lock(path):
         snapshot = read_vault_snapshot(path)
         header = parse_header(snapshot.data)
-        payload = _decrypt_vault_bytes(snapshot.data, password)
-        updated = transform(payload)
-        plaintext = bytearray(serialize_payload(updated))
         kek = bytearray()
+        plaintext = bytearray()
         try:
             kek = bytearray(derive_kek(password, header.salt))
+            payload = _decrypt_vault_bytes_with_kek(snapshot.data, header, kek)
+            updated = transform(payload)
+            plaintext = bytearray(serialize_payload(updated))
             blob = _encrypt_payload_bytes(
                 plaintext,
                 kek,
@@ -265,20 +266,28 @@ def _paths_alias(first: Path, second: Path) -> bool:
 
 def _decrypt_vault_bytes(data: bytes, password: bytes) -> dict[str, Any]:
     header = parse_header(data)
+    kek = bytearray()
+    try:
+        kek = bytearray(derive_kek(password, header.salt))
+        return _decrypt_vault_bytes_with_kek(data, header, kek)
+    finally:
+        wipe(kek)
+
+
+def _decrypt_vault_bytes_with_kek(
+    data: bytes, header: VaultHeader, kek: bytearray
+) -> dict[str, Any]:
     wrap_data = wrap_aad(data)
     body_data = body_aad(data)
     body_ciphertext = data[HEADER_LEN:]
 
-    kek = bytearray()
     dek = bytearray()
     plaintext = bytearray()
     try:
-        kek = bytearray(derive_kek(password, header.salt))
         dek = bytearray(unwrap_dek(kek, header.wrap_nonce, header.wrapped_key, aad=wrap_data))
         plaintext = bytearray(decrypt_body(dek, header.body_nonce, body_ciphertext, aad=body_data))
         return deserialize_payload(bytes(plaintext))
     finally:
-        wipe(kek)
         wipe(dek)
         wipe(plaintext)
 

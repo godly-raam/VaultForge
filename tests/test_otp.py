@@ -155,6 +155,12 @@ def test_time_remaining_counts_down_between_boundaries():
     assert time_remaining(30, for_time=15.0) == 15
 
 
+def test_time_remaining_subsecond_precision_never_returns_zero():
+    assert time_remaining(30, for_time=29.2) == 1
+    assert time_remaining(30, for_time=29.999) == 1
+    assert time_remaining(30, for_time=0.001) == 30
+
+
 def test_time_remaining_rejects_bad_period():
     with pytest.raises(OTPError):
         time_remaining(0)

@@ -126,7 +126,10 @@ def _snapshot_from_fd(fd: int, path: Path) -> VaultSnapshot:
     data = b"".join(chunks)
     after = os.fstat(fd)
     check_file_size(len(data))
-    current = path.stat()
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise ConcurrentModificationError("vault changed while it was being read") from exc
     if (
         before.st_dev != after.st_dev
         or before.st_ino != after.st_ino
